@@ -485,6 +485,10 @@ class MarketHub:
         if not self._connected or not self._xtdata:
             return
 
+        # 这里直接订阅全市场的tick信息.
+        sid = self._xtdata.subscribe_whole_quote(['SH', 'SZ'], callback=self._on_tick)
+        logger.info(f"[OK] 订阅全市场的tick推送信息, 订阅id: {sid}")
+
         pool = self._redis.get_sub_pool()
         if not pool:
             logger.info("[INFO] 订阅池为空，无需恢复")
@@ -496,7 +500,6 @@ class MarketHub:
         with self._sub_lock:
             for code in codes:
                 try:
-                    self._xtdata.subscribe_quote(code, callback=self._on_tick)
                     self._subscribed_codes.add(code)
                 except Exception as e:
                     logger.error("[ERROR] 恢复订阅 %s 失败: %s", code, e)
