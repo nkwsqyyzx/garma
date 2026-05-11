@@ -1,0 +1,50 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "log_level": "INFO",
+    "workers": 1
+  },
+  "market_server": {
+    "port": 3301
+  },
+  "trade_server": {
+    "port": 3300
+  },
+  "qmt": {
+    "mini_path": "D:/xtqmt/userdata_mini",
+    "account_id": "010400006562",
+    "account_type": "STOCK",
+    "session_id": 1001,
+    "connect_timeout": 10,
+    "reconnect_interval": 30,
+    "reconnect_max_retry": -1
+  },
+  "redis": {
+    "host": "192.168.1.70",
+    "port": 6379,
+    "db": 1,
+    "socket_timeout": 3,
+    "socket_connect_timeout": 3,
+    "retry_on_timeout": true,
+    "health_check_interval": 30
+  },
+  "market": {
+    "max_subscribe_count": 500,
+    "tick_stream_maxlen": 500,
+    "agg_stream_maxlen": 50000,
+    "kline_stream_maxlen": 1000,
+    "heartbeat_interval": 10
+  },
+  "trade": {
+    "cmd_queue_timeout": 5,
+    "order_timeout": 10,
+    "max_retry": 3,
+    "dlq_alert": true
+  },
+  "account": {
+    "sync_interval_asset": 5,
+    "sync_interval_positions": 5,
+    "sync_interval_orders": 3,
+    "sync_interval_trades": 3
+  }
+}
