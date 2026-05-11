@@ -241,41 +241,41 @@ class TradeHub:
     # ------------------------------------------------------------------
 
     def query_asset(self) -> Optional[object]:
-        """查询资金"""
+        """查询资金（同步，在后台线程中调用）"""
         if not self._connected or not self._trader:
             return None
         try:
-            return self._trader.query_stock_asset_async(self._account)
+            return self._trader.query_stock_asset(self._account)
         except Exception:
             logger.error("[ERROR] query_asset 异常", exc_info=True)
             return None
 
     def query_positions(self) -> Optional[list]:
-        """查询持仓"""
+        """查询持仓（同步，在后台线程中调用）"""
         if not self._connected or not self._trader:
             return None
         try:
-            return self._trader.query_stock_positions_async(self._account)
+            return self._trader.query_stock_positions(self._account)
         except Exception:
             logger.error("[ERROR] query_positions 异常", exc_info=True)
             return None
 
     def query_orders(self) -> Optional[list]:
-        """查询当日委托"""
+        """查询当日委托（同步，在后台线程中调用）"""
         if not self._connected or not self._trader:
             return None
         try:
-            return self._trader.query_stock_orders_async(self._account)
+            return self._trader.query_stock_orders(self._account)
         except Exception:
             logger.error("[ERROR] query_orders 异常", exc_info=True)
             return None
 
     def query_trades(self) -> Optional[list]:
-        """查询当日成交"""
+        """查询当日成交（同步，在后台线程中调用）"""
         if not self._connected or not self._trader:
             return None
         try:
-            return self._trader.query_stock_trades_async(self._account)
+            return self._trader.query_stock_trades(self._account)
         except Exception:
             logger.error("[ERROR] query_trades 异常", exc_info=True)
             return None
