@@ -22,6 +22,7 @@ if str(_MARKET_DIR) not in sys.path:
     sys.path.insert(0, str(_MARKET_DIR))
 
 import uvicorn
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 
 from shared.redis_bridge import RedisBridge
@@ -165,6 +166,71 @@ def _create_control_router():
 # 应用工厂
 # ------------------------------------------------------------------
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    config = app.state.config
+
+    # ---- Startup ----
+    logger.info("[STARTUP] qmt-market 正在启动 ...")
+
+    # 1. 初始化 Redis
+    redis_bridge = RedisBridge(config)
+    app.state.redis_bridge = redis_bridge
+    logger.info("[OK] Redis 连接初始化完成")
+
+    # 2. 初始化 MarketHub
+    market_hub = MarketHub(redis_bridge, config)
+    app.state.market_hub = market_hub
+    market_hub.start()
+    logger.info("[OK] MarketHub 启动完成")
+
+    # 3. 初始化 StatusReporter
+    reporter = StatusReporter(redis_bridge, market_hub, config)
+    app.state.status_reporter = reporter
+    reporter.start()
+    logger.info("[OK] StatusReporter 启动完成")
+
+    market_cfg = config.get("market_server", {})
+    port = market_cfg.get("port", 8091)
+    logger.info("[STARTUP] qmt-market 启动完成，监听 :%d", port)
+
+    yield  # ---- 应用运行中 ----
+
+    # ---- Shutdown（优雅关机）----
+    logger.info("[SHUTDOWN] qmt-market 正在关机 ...")
+
+    # 1. 停止接受新请求（FastAPI shutdown 事件自动处理）
+    # 2. 设置 _running = False，通知后台线程退出
+    reporter: StatusReporter = app.state.status_reporter
+    if reporter:
+        reporter.stop()
+
+    hub: MarketHub = app.state.market_hub
+    if hub:
+        hub.stop()
+
+    # 3. 等待后台线程退出
+    if reporter and reporter._thread and reporter._thread.is_alive():
+        reporter._thread.join(timeout=5)
+
+    # 4. 写入 shutting_down 状态（TTL=10s）
+    redis_bridge: RedisBridge = app.state.redis_bridge
+    if redis_bridge:
+        redis_bridge.raw.set(
+            "qmt:market:status",
+            '{"source":"market","overall_status":"shutting_down"}',
+            ex=10,
+        )
+
+    # 5. 断开 xtdata 连接（hub.stop 已处理）
+
+    # 6. 关闭 Redis 连接池
+    if redis_bridge:
+        redis_bridge.close()
+
+    logger.info("[SHUTDOWN] qmt-market 已停止")
+
+
 def create_app() -> FastAPI:
     config = load_config()
 
@@ -172,6 +238,7 @@ def create_app() -> FastAPI:
         title="QMT Market Service",
         description="A 股行情服务（xtdata → Redis Stream）",
         version="1.0.0",
+        lifespan=lifespan,
     )
 
     # 存储到 app.state
@@ -190,68 +257,6 @@ def create_app() -> FastAPI:
     @app.websocket("/ws/quote")
     async def ws_quote(websocket: WebSocket):
         await _ws_quote_handler(websocket)
-
-    # ---- Startup ----
-    @app.on_event("startup")
-    async def startup():
-        logger.info("[STARTUP] qmt-market 正在启动 ...")
-
-        # 1. 初始化 Redis
-        redis_bridge = RedisBridge(config)
-        app.state.redis_bridge = redis_bridge
-        logger.info("[OK] Redis 连接初始化完成")
-
-        # 2. 初始化 MarketHub
-        market_hub = MarketHub(redis_bridge, config)
-        app.state.market_hub = market_hub
-        market_hub.start()
-        logger.info("[OK] MarketHub 启动完成")
-
-        # 3. 初始化 StatusReporter
-        reporter = StatusReporter(redis_bridge, market_hub, config)
-        app.state.status_reporter = reporter
-        reporter.start()
-        logger.info("[OK] StatusReporter 启动完成")
-
-        market_cfg = config.get("market_server", {})
-        port = market_cfg.get("port", 8091)
-        logger.info("[STARTUP] qmt-market 启动完成，监听 :%d", port)
-
-    # ---- Shutdown（优雅关机）----
-    @app.on_event("shutdown")
-    async def shutdown():
-        logger.info("[SHUTDOWN] qmt-market 正在关机 ...")
-
-        # 1. 停止接受新请求（FastAPI shutdown 事件自动处理）
-        # 2. 设置 _running = False，通知后台线程退出
-        reporter: StatusReporter = app.state.status_reporter
-        if reporter:
-            reporter.stop()
-
-        hub: MarketHub = app.state.market_hub
-        if hub:
-            hub.stop()
-
-        # 3. 等待后台线程退出
-        if reporter and reporter._thread and reporter._thread.is_alive():
-            reporter._thread.join(timeout=5)
-
-        # 4. 写入 shutting_down 状态（TTL=10s）
-        redis_bridge: RedisBridge = app.state.redis_bridge
-        if redis_bridge:
-            redis_bridge.raw.set(
-                "qmt:market:status",
-                '{"source":"market","overall_status":"shutting_down"}',
-                ex=10,
-            )
-
-        # 5. 断开 xtdata 连接（hub.stop 已处理）
-
-        # 6. 关闭 Redis 连接池
-        if redis_bridge:
-            redis_bridge.close()
-
-        logger.info("[SHUTDOWN] qmt-market 已停止")
 
     return app
 

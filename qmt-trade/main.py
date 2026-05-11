@@ -19,6 +19,7 @@ if str(_TRADE_DIR) not in sys.path:
     sys.path.insert(0, str(_TRADE_DIR))
 
 import uvicorn
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 
 from shared.redis_bridge import RedisBridge
@@ -90,6 +91,142 @@ def _create_control_router():
     return router
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    config = app.state.config
+
+    # ---- Startup ----
+    logger.info("[STARTUP] qmt-trade 正在启动 ...")
+
+    # 1. 初始化 Redis
+    redis_bridge = RedisBridge(config)
+    app.state.redis_bridge = redis_bridge
+    logger.info("[OK] Redis 连接初始化完成")
+
+    # 2. 冷启动恢复：检查备份队列是否有遗留命令
+    recovered = redis_bridge.recover_backup_cmds()
+    if recovered > 0:
+        logger.info("[OK] 从备份队列恢复 %d 条命令", recovered)
+
+    # 3. 初始化线程池
+    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="trade-exec")
+    app.state.executor = executor
+
+    # 4. 初始化 TradeHub
+    trade_hub = TradeHub(redis_bridge, config)
+    app.state.trade_hub = trade_hub
+
+    # 5. 初始化 AccountHub
+    account_hub = AccountHub(trade_hub, redis_bridge, config, executor=executor)
+    app.state.account_hub = account_hub
+
+    # 6. 先创建 SessionMgr（后续注入 callback_handler）
+    session_mgr = SessionMgr(trade_hub)
+    app.state.session_mgr = session_mgr
+
+    # 7. 初始化 CallbackHandler
+    callback_handler = CallbackHandler(
+        account_hub, session_mgr, redis_bridge, executor
+    )
+    app.state.callback_handler = callback_handler
+
+    # 7.1 注入 callback_handler 和 account_hub 到 SessionMgr（用于重连后恢复）
+    session_mgr.set_post_reconnect_deps(callback_handler, account_hub)
+
+    # 8. 连接 xttrader + 注册回调
+    if trade_hub.connect():
+        trade_hub.register_callback(callback_handler)
+        logger.info("[OK] xttrader 连接成功")
+    else:
+        logger.warning("[WARN] xttrader 初始连接失败，将通过 SessionMgr 重连")
+        # 仍然注册回调，等待重连后生效
+        trade_hub.register_callback(callback_handler)
+
+    # 9. 启动 AccountHub 轮询线程
+    account_hub.start()
+
+    # 10. 启动 CmdConsumer
+    cmd_consumer = CmdConsumer(trade_hub, redis_bridge, config)
+    app.state.cmd_consumer = cmd_consumer
+    cmd_consumer.start()
+
+    # 11. 初始化 StatusReporter
+    reporter = StatusReporter(
+        redis_bridge, trade_hub, account_hub, cmd_consumer, config
+    )
+    app.state.status_reporter = reporter
+    reporter.start()
+
+    trade_cfg = config.get("trade_server", {})
+    port = trade_cfg.get("port", 8090)
+    logger.info("[STARTUP] qmt-trade 启动完成，监听 :%d", port)
+
+    yield  # ---- 应用运行中 ----
+
+    # ---- Shutdown ----
+    logger.info("[SHUTDOWN] qmt-trade 正在关机 ...")
+
+    # 1. 停止接受新请求
+    # 2. 设置 _running = False
+    cmd_consumer: CmdConsumer = app.state.cmd_consumer
+    if cmd_consumer:
+        cmd_consumer.stop()
+
+    account_hub: AccountHub = app.state.account_hub
+    if account_hub:
+        account_hub.stop()
+
+    reporter: StatusReporter = app.state.status_reporter
+    if reporter:
+        reporter.stop()
+
+    session_mgr: SessionMgr = app.state.session_mgr
+    if session_mgr:
+        session_mgr.stop()
+
+    # 3. 等待 CmdConsumer 完成当前命令
+    if cmd_consumer:
+        cmd_consumer.join(timeout=15)
+
+    # 4. 检查备份队列，未确认命令回主队列
+    redis_bridge: RedisBridge = app.state.redis_bridge
+    if redis_bridge:
+        redis_bridge.recover_backup_cmds()
+
+    # 5. 等待 AccountHub 后台线程
+    # (account_hub._poll_thread 是 daemon，join 5s)
+    if account_hub and account_hub._poll_thread and account_hub._poll_thread.is_alive():
+        account_hub._poll_thread.join(timeout=5)
+
+    # 6. 等待 StatusReporter
+    if reporter and reporter._thread and reporter._thread.is_alive():
+        reporter._thread.join(timeout=5)
+
+    # 7. 写入 shutting_down 状态（TTL=10s）
+    if redis_bridge:
+        redis_bridge.raw.set(
+            "qmt:trade:status",
+            '{"source":"trade","overall_status":"shutting_down"}',
+            ex=10,
+        )
+
+    # 8. 断开 xttrader
+    trade_hub: TradeHub = app.state.trade_hub
+    if trade_hub:
+        trade_hub.disconnect()
+
+    # 9. 关闭线程池
+    executor: ThreadPoolExecutor = app.state.executor
+    if executor:
+        executor.shutdown(wait=False)
+
+    # 10. 关闭 Redis
+    if redis_bridge:
+        redis_bridge.close()
+
+    logger.info("[SHUTDOWN] qmt-trade 已停止")
+
+
 def create_app() -> FastAPI:
     config = load_config()
 
@@ -97,6 +234,7 @@ def create_app() -> FastAPI:
         title="QMT Trade Service",
         description="A 股交易服务（Redis queue → xttrader）",
         version="1.0.0",
+        lifespan=lifespan,
     )
 
     app.state.config = config
@@ -110,137 +248,6 @@ def create_app() -> FastAPI:
 
     app.include_router(create_router())
     app.include_router(_create_control_router())
-
-    @app.on_event("startup")
-    async def startup():
-        logger.info("[STARTUP] qmt-trade 正在启动 ...")
-
-        # 1. 初始化 Redis
-        redis_bridge = RedisBridge(config)
-        app.state.redis_bridge = redis_bridge
-        logger.info("[OK] Redis 连接初始化完成")
-
-        # 2. 冷启动恢复：检查备份队列是否有遗留命令
-        recovered = redis_bridge.recover_backup_cmds()
-        if recovered > 0:
-            logger.info("[OK] 从备份队列恢复 %d 条命令", recovered)
-
-        # 3. 初始化线程池
-        executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="trade-exec")
-        app.state.executor = executor
-
-        # 4. 初始化 TradeHub
-        trade_hub = TradeHub(redis_bridge, config)
-        app.state.trade_hub = trade_hub
-
-        # 5. 初始化 AccountHub
-        account_hub = AccountHub(trade_hub, redis_bridge, config, executor=executor)
-        app.state.account_hub = account_hub
-
-        # 6. 先创建 SessionMgr（后续注入 callback_handler）
-        session_mgr = SessionMgr(trade_hub)
-        app.state.session_mgr = session_mgr
-
-        # 7. 初始化 CallbackHandler
-        callback_handler = CallbackHandler(
-            account_hub, session_mgr, redis_bridge, executor
-        )
-        app.state.callback_handler = callback_handler
-
-        # 7.1 注入 callback_handler 和 account_hub 到 SessionMgr（用于重连后恢复）
-        session_mgr.set_post_reconnect_deps(callback_handler, account_hub)
-
-        # 8. 连接 xttrader + 注册回调
-        if trade_hub.connect():
-            trade_hub.register_callback(callback_handler)
-            logger.info("[OK] xttrader 连接成功")
-        else:
-            logger.warning("[WARN] xttrader 初始连接失败，将通过 SessionMgr 重连")
-            # 仍然注册回调，等待重连后生效
-            trade_hub.register_callback(callback_handler)
-
-        # 9. 启动 AccountHub 轮询线程
-        account_hub.start()
-
-        # 10. 启动 CmdConsumer
-        cmd_consumer = CmdConsumer(trade_hub, redis_bridge, config)
-        app.state.cmd_consumer = cmd_consumer
-        cmd_consumer.start()
-
-        # 11. 初始化 StatusReporter
-        reporter = StatusReporter(
-            redis_bridge, trade_hub, account_hub, cmd_consumer, config
-        )
-        app.state.status_reporter = reporter
-        reporter.start()
-
-        trade_cfg = config.get("trade_server", {})
-        port = trade_cfg.get("port", 8090)
-        logger.info("[STARTUP] qmt-trade 启动完成，监听 :%d", port)
-
-    @app.on_event("shutdown")
-    async def shutdown():
-        logger.info("[SHUTDOWN] qmt-trade 正在关机 ...")
-
-        # 1. 停止接受新请求
-        # 2. 设置 _running = False
-        cmd_consumer: CmdConsumer = app.state.cmd_consumer
-        if cmd_consumer:
-            cmd_consumer.stop()
-
-        account_hub: AccountHub = app.state.account_hub
-        if account_hub:
-            account_hub.stop()
-
-        reporter: StatusReporter = app.state.status_reporter
-        if reporter:
-            reporter.stop()
-
-        session_mgr: SessionMgr = app.state.session_mgr
-        if session_mgr:
-            session_mgr.stop()
-
-        # 3. 等待 CmdConsumer 完成当前命令
-        if cmd_consumer:
-            cmd_consumer.join(timeout=15)
-
-        # 4. 检查备份队列，未确认命令回主队列
-        redis_bridge: RedisBridge = app.state.redis_bridge
-        if redis_bridge:
-            redis_bridge.recover_backup_cmds()
-
-        # 5. 等待 AccountHub 后台线程
-        # (account_hub._poll_thread 是 daemon，join 5s)
-        if account_hub and account_hub._poll_thread and account_hub._poll_thread.is_alive():
-            account_hub._poll_thread.join(timeout=5)
-
-        # 6. 等待 StatusReporter
-        if reporter and reporter._thread and reporter._thread.is_alive():
-            reporter._thread.join(timeout=5)
-
-        # 7. 写入 shutting_down 状态（TTL=10s）
-        if redis_bridge:
-            redis_bridge.raw.set(
-                "qmt:trade:status",
-                '{"source":"trade","overall_status":"shutting_down"}',
-                ex=10,
-            )
-
-        # 8. 断开 xttrader
-        trade_hub: TradeHub = app.state.trade_hub
-        if trade_hub:
-            trade_hub.disconnect()
-
-        # 9. 关闭线程池
-        executor: ThreadPoolExecutor = app.state.executor
-        if executor:
-            executor.shutdown(wait=False)
-
-        # 10. 关闭 Redis
-        if redis_bridge:
-            redis_bridge.close()
-
-        logger.info("[SHUTDOWN] qmt-trade 已停止")
 
     return app
 
