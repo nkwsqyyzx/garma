@@ -9,7 +9,7 @@ import time
 from datetime import date
 from typing import Optional
 
-from shared.const import KEY_KILL_SWITCH
+from shared.const import CANCELABLE_STATUSES, KEY_KILL_SWITCH
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +192,7 @@ class CmdConsumer:
         if not orders:
             return
 
-        cancelable = {"SUBMITTED", "PARTIALLY_FILLED", "PENDING"}
+        cancelable = CANCELABLE_STATUSES
         cancelled_count = 0
         for order in orders:
             if order.get("status") in cancelable:

@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize_asset(raw) -> dict:
-    """标准化 xtquant 资金数据"""
+    """标准化 xtquant 资金数据（XtAsset 只有 cash/frozen_cash/market_value/total_asset）"""
     if raw is None:
         return {}
     try:
@@ -25,8 +25,6 @@ def _normalize_asset(raw) -> dict:
             "cash": float(getattr(raw, "cash", 0)),
             "frozen_cash": float(getattr(raw, "frozen_cash", 0)),
             "market_value": float(getattr(raw, "market_value", 0)),
-            "profit_loss": float(getattr(raw, "profit_loss", 0)),
-            "profit_loss_ratio": float(getattr(raw, "profit_loss_ratio", 0)),
             "updated_at": time.time(),
             "updated_by": "full_sync",
         }
@@ -35,19 +33,27 @@ def _normalize_asset(raw) -> dict:
 
 
 def _normalize_position(raw) -> dict:
-    """标准化 xtquant 持仓数据"""
+    """标准化 xtquant 持仓数据（profit_loss/profit_loss_ratio 由 open_price*volume 和 market_value 计算）"""
     try:
+        volume = int(getattr(raw, "volume", 0))
+        open_price = float(getattr(raw, "open_price", 0))
+        market_value = float(getattr(raw, "market_value", 0))
+        cost = open_price * volume
+        profit_loss = round(market_value - cost, 4)
+        profit_loss_ratio = round(profit_loss / cost * 100, 4) if cost > 0 else 0.0
         return {
             "account_id": getattr(raw, "account_id", ""),
             "stock_code": getattr(raw, "stock_code", ""),
-            "stock_name": getattr(raw, "stock_name", ""),
-            "volume": int(getattr(raw, "volume", 0)),
+            "volume": volume,
             "can_use_volume": int(getattr(raw, "can_use_volume", 0)),
+            "frozen_volume": int(getattr(raw, "frozen_volume", 0)),
+            "on_road_volume": int(getattr(raw, "on_road_volume", 0)),
+            "yesterday_volume": int(getattr(raw, "yesterday_volume", 0)),
             "avg_price": float(getattr(raw, "avg_price", 0)),
-            "market_value": float(getattr(raw, "market_value", 0)),
-            "profit_loss": float(getattr(raw, "profit_loss", 0)),
-            "profit_loss_ratio": float(getattr(raw, "profit_loss_ratio", 0)),
-            "open_price": float(getattr(raw, "open_price", 0)),
+            "open_price": open_price,
+            "market_value": market_value,
+            "profit_loss": profit_loss,
+            "profit_loss_ratio": profit_loss_ratio,
             "updated_at": time.time(),
         }
     except Exception:
@@ -55,17 +61,17 @@ def _normalize_position(raw) -> dict:
 
 
 def _normalize_order(raw) -> dict:
-    """标准化 xtquant 委托数据"""
+    """标准化 xtquant 委托数据（XtOrder 无 stock_name）"""
     try:
         return {
             "order_id": str(getattr(raw, "order_id", "")),
             "order_sysid": getattr(raw, "order_sysid", "") or "",
             "account_id": getattr(raw, "account_id", ""),
             "stock_code": getattr(raw, "stock_code", ""),
-            "stock_name": getattr(raw, "stock_name", ""),
             "order_type": "buy" if getattr(raw, "order_type", 0) == 23 else "sell",
             "order_volume": int(getattr(raw, "order_volume", 0)),
             "traded_volume": int(getattr(raw, "traded_volume", 0)),
+            "price_type": int(getattr(raw, "price_type", 0)),
             "price": float(getattr(raw, "price", 0)),
             "traded_price": float(getattr(raw, "traded_price", 0)),
             "status": ORDER_STATUS_MAP.get(getattr(raw, "order_status", -1), "UNKNOWN"),
@@ -73,6 +79,7 @@ def _normalize_order(raw) -> dict:
             "order_time": getattr(raw, "order_time", "") or "",
             "strategy_name": getattr(raw, "strategy_name", "") or "",
             "order_remark": getattr(raw, "order_remark", "") or "",
+            "offset_flag": int(getattr(raw, "offset_flag", 0)),
             "updated_at": time.time(),
         }
     except Exception:
@@ -80,14 +87,14 @@ def _normalize_order(raw) -> dict:
 
 
 def _normalize_trade(raw) -> dict:
-    """标准化 xtquant 成交数据"""
+    """标准化 xtquant 成交数据（XtTrade 无 stock_name，有 commission）"""
     try:
         return {
             "traded_id": getattr(raw, "traded_id", "") or "",
             "order_id": str(getattr(raw, "order_id", "")),
+            "order_sysid": getattr(raw, "order_sysid", "") or "",
             "account_id": getattr(raw, "account_id", ""),
             "stock_code": getattr(raw, "stock_code", ""),
-            "stock_name": getattr(raw, "stock_name", ""),
             "order_type": "buy" if getattr(raw, "order_type", 0) == 23 else "sell",
             "traded_volume": int(getattr(raw, "traded_volume", 0)),
             "traded_price": float(getattr(raw, "traded_price", 0)),
@@ -95,6 +102,7 @@ def _normalize_trade(raw) -> dict:
             "traded_time": getattr(raw, "traded_time", "") or "",
             "strategy_name": getattr(raw, "strategy_name", "") or "",
             "order_remark": getattr(raw, "order_remark", "") or "",
+            "commission": float(getattr(raw, "commission", 0)),
         }
     except Exception:
         return {}
@@ -122,6 +130,7 @@ class AccountHub:
 
         # 元信息
         self._last_full_sync_at: float = 0.0
+        self._last_sync_log_at: dict = {}  # account_id → timestamp，日志频控
         self._last_asset_sync_at: float = 0.0
         self._refreshing = False
 
@@ -280,7 +289,11 @@ class AccountHub:
                 list(self._orders[account_id].values()),
                 list(self._trades[account_id].values()),
             )
-            logger.info("[OK] AccountHub 全量同步完成 account=%s", account_id)
+            now = time.time()
+            last = self._last_sync_log_at.get(account_id, 0)
+            if now - last >= 30:
+                logger.info("[OK] AccountHub 全量同步完成 account=%s", account_id)
+                self._last_sync_log_at[account_id] = now
         except Exception:
             logger.error("[ERROR] AccountHub 全量同步失败", exc_info=True)
 

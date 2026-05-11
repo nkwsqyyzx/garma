@@ -264,6 +264,11 @@ def main():
     log_dir = _BASE_DIR / "logs" / "trade"
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    # 启用 faulthandler 以在 C 扩展崩溃（如 segfault）时输出 traceback
+    import faulthandler
+    crash_log = open(str(log_dir / "crash.log"), "w", encoding="utf-8")
+    faulthandler.enable(file=crash_log, all_threads=True)
+
     logging.basicConfig(
         level=getattr(logging, log_level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

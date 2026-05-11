@@ -328,15 +328,35 @@ class RedisBridge:
             return 0
 
     def recover_backup_cmds(self) -> int:
-        """冷启动时从备份队列恢复未确认命令，返回恢复数量"""
+        """冷启动时从备份队列恢复未确认命令。
+        带恢复计数：超过 1 次恢复的命令转入 DLQ，防止崩溃死循环。
+        """
         try:
             items = self._redis.lrange(KEY_CMD_QUEUE_BACKUP, 0, -1)
             if not items:
                 return 0
+            recovered = 0
             for item in items:
-                self._redis.lpush(KEY_CMD_QUEUE, item)
+                try:
+                    cmd = json.loads(item)
+                    recovery_count = cmd.get("_recovery_count", 0) + 1
+                    if recovery_count > 1:
+                        cmd["_recovery_count"] = recovery_count
+                        cmd["_dlq_reason"] = "多次恢复失败（可能触发进程崩溃）"
+                        self._redis.lpush(KEY_CMD_DLQ,
+                                          json.dumps(cmd, ensure_ascii=False))
+                        logger.error(
+                            "[ERROR] 命令多次恢复失败转入死信 req_id=%s recoveries=%d",
+                            cmd.get("req_id"), recovery_count)
+                        continue
+                    cmd["_recovery_count"] = recovery_count
+                    self._redis.lpush(KEY_CMD_QUEUE,
+                                      json.dumps(cmd, ensure_ascii=False))
+                    recovered += 1
+                except (json.JSONDecodeError, Exception):
+                    self._redis.lpush(KEY_CMD_DLQ, item)
             self._redis.delete(KEY_CMD_QUEUE_BACKUP)
-            return len(items)
+            return recovered
         except redis.RedisError:
             return 0
 

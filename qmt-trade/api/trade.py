@@ -35,8 +35,8 @@ async def place_order(req: PlaceOrderRequest, request: Request):
         "order_volume": req.order_volume,
         "price_type": req.price_type,
         "price": req.price,
-        "strategy_name": req.strategy_name,
-        "order_remark": req.order_remark,
+        "strategy_name": req.strategy_name or "",
+        "order_remark": req.order_remark or "",
         "retry_count": 0,
         "created_at": time.time(),
     }
