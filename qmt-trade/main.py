@@ -5,9 +5,23 @@ FastAPI :8090 + TradeHub + AccountHub + CmdConsumer + CallbackHandler。
 
 import json
 import logging
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+_SHANGHAI_TZ = timezone(timedelta(hours=8))
+
+
+class _ShanghaiFormatter(logging.Formatter):
+    """强制使用 Asia/Shanghai (UTC+8) 时区的日志 Formatter，跨平台通用。"""
+
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=_SHANGHAI_TZ)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.strftime("%Y-%m-%d %H:%M:%S") + f",{int(record.msecs):03d}"
 
 # ---- sys.path 设置 ----
 _BASE_DIR = Path(__file__).resolve().parent.parent
@@ -272,11 +286,17 @@ def main():
     logging.basicConfig(
         level=getattr(logging, log_level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
             logging.StreamHandler(),
             logging.FileHandler(str(log_dir / "app.log"), encoding="utf-8"),
         ],
     )
+    for h in logging.root.handlers:
+        h.setFormatter(_ShanghaiFormatter(
+            fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
 
     host = server_cfg.get("host", "0.0.0.0")
     port = trade_cfg.get("port", 8090)

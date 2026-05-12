@@ -7,8 +7,22 @@ FastAPI :8091 + MarketHub 后台线程 + StatusReporter 定时上报。
 
 import json
 import logging
+import os
 import sys
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+_SHANGHAI_TZ = timezone(timedelta(hours=8))
+
+
+class _ShanghaiFormatter(logging.Formatter):
+    """强制使用 Asia/Shanghai (UTC+8) 时区的日志 Formatter，跨平台通用。"""
+
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=_SHANGHAI_TZ)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.strftime("%Y-%m-%d %H:%M:%S") + f",{int(record.msecs):03d}"
 
 # ---- sys.path 设置 ----
 # 1. 项目根目录（qmt-server/）→ 使 shared 模块可被 import
@@ -281,11 +295,17 @@ def main():
     logging.basicConfig(
         level=getattr(logging, log_level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
             logging.StreamHandler(),
             logging.FileHandler(str(log_dir / "app.log"), encoding="utf-8"),
         ],
     )
+    for h in logging.root.handlers:
+        h.setFormatter(_ShanghaiFormatter(
+            fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
 
     host = server_cfg.get("host", "0.0.0.0")
     port = market_cfg.get("port", 8091)
