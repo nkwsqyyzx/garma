@@ -7,6 +7,7 @@
 """
 
 import json
+import math
 import time
 import uuid
 from typing import Any
@@ -68,13 +69,15 @@ class QmtService:
         """批量获取 Tick 快照，HMGET qmt:snapshot:tick。"""
         if not codes:
             return {}
-        data = await self._redis_hgetall(KEY_SNAPSHOT_TICK)
+        import asyncio as _aio
+        values = await _aio.to_thread(self._redis.hmget, KEY_SNAPSHOT_TICK, *codes)
         result = {}
-        for code in codes:
-            raw = data.get(code)
+        for code, raw in zip(codes, values):
             if raw:
                 try:
-                    result[code] = json.loads(raw) if isinstance(raw, str) else raw
+                    data = _sanitize_floats(json.loads(raw) if isinstance(raw, str) else raw)
+                    _enrich_tick(data)
+                    result[code] = data
                 except (json.JSONDecodeError, TypeError):
                     pass
         return result
@@ -85,7 +88,9 @@ class QmtService:
         if not raw:
             return None
         try:
-            return json.loads(raw) if isinstance(raw, str) else raw
+            data = _sanitize_floats(json.loads(raw) if isinstance(raw, str) else raw)
+            _enrich_tick(data)
+            return data
         except (json.JSONDecodeError, TypeError):
             return None
 
@@ -98,8 +103,8 @@ class QmtService:
         try:
             data = json.loads(raw) if isinstance(raw, str) else raw
             if isinstance(data, list):
-                return data[-count:]
-            return [data]
+                return _sanitize_floats(data[-count:])
+            return [_sanitize_floats(data)]
         except (json.JSONDecodeError, TypeError):
             return []
 
@@ -262,8 +267,10 @@ class QmtService:
     async def forward_to_market(self, method: str, path: str,
                                 params: dict | None = None,
                                 body: dict | None = None) -> dict:
-        """转发请求到 QMT 行情服务 (:8091)。"""
-        market_url = self._config.QMT_SERVER_URL.replace(":8090", ":8091")
+        """转发请求到 QMT 行情服务。"""
+        market_url = self._config.QMT_MARKET_URL
+        if not market_url:
+            market_url = self._config.QMT_SERVER_URL.replace(":8090", ":8091")
         try:
             async with httpx.AsyncClient(
                 base_url=market_url,
@@ -415,7 +422,8 @@ class QmtService:
         if not raw:
             return None
         try:
-            return json.loads(raw) if isinstance(raw, str) else raw
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            return _sanitize_floats(data)
         except (json.JSONDecodeError, TypeError):
             return None
 
@@ -425,3 +433,29 @@ class QmtService:
 
     async def close(self) -> None:
         await self._http.aclose()
+
+
+def _sanitize_floats(obj):
+    """递归清理 JSON 数据中的 NaN / Inf 浮点数，替换为 None。"""
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_floats(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_floats(v) for v in obj]
+    return obj
+
+
+def _enrich_tick(data: dict) -> None:
+    """补算上游缺失的 Tick 派生字段（就地修改）。"""
+    if not isinstance(data, dict):
+        return
+    last = data.get("last")
+    close = data.get("close")
+    if last is not None and close and close != 0:
+        if not data.get("change"):
+            data["change"] = round(last - close, 4)
+        if not data.get("pct_change"):
+            data["pct_change"] = round((last - close) / close * 100, 4)

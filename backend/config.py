@@ -4,8 +4,12 @@
 包含 Redis 键常量（从 shared/const.py 复制，因为 shared/ 在 Windows 端不可导入）。
 """
 
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+
+_BACKEND_DIR = Path(__file__).resolve().parent
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +48,7 @@ class Settings(BaseSettings):
 
     # QMT-Server 连接
     QMT_SERVER_URL: str = "http://192.168.3.10:8090"
+    QMT_MARKET_URL: str = ""  # 行情服务地址，为空时从 QMT_SERVER_URL 推导（:8090 → :8091）
     QMT_SERVER_API_KEY: str = ""
     QMT_SERVER_TIMEOUT: int = 10
 
@@ -64,7 +69,7 @@ class Settings(BaseSettings):
     BACKEND_PORT: int = 8000
 
     model_config = {
-        "env_file": ".env",
+        "env_file": str(_BACKEND_DIR / ".env"),
         "env_file_encoding": "utf-8",
         "extra": "ignore",
     }

@@ -23,7 +23,6 @@ class QmtOrderWorker:
 
     def start(self) -> asyncio.Task:
         self._running = True
-        self._ensure_group()
         self._task = asyncio.create_task(self._run(), name="qmt-order-worker")
         logger.info("QmtOrderWorker started")
         return self._task
@@ -55,6 +54,7 @@ class QmtOrderWorker:
                 raise
 
     async def _run(self) -> None:
+        await asyncio.to_thread(self._ensure_group)
         while self._running:
             try:
                 # XREADGROUP 阻塞 5000ms

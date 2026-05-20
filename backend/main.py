@@ -77,7 +77,7 @@ async def lifespan(app: FastAPI):
         socket_connect_timeout=5,
         health_check_interval=30,
     )
-    redis_client.ping()
+    await asyncio.to_thread(redis_client.ping)
     logger.info("Redis connected: {}", settings.REDIS_URL.split("@")[-1])
 
     # 2. 初始化数据库
