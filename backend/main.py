@@ -6,10 +6,13 @@ FastAPI 应用，启动/关闭生命周期管理，WebSocket 端点。
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import redis
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from backend.config import get_settings
@@ -17,6 +20,7 @@ from backend.database import init_db, close_db
 from backend.service.qmt_service import QmtService
 from backend.worker.qmt_order_worker import QmtOrderWorker
 from backend.worker.qmt_status_worker import QmtStatusWorker
+from backend.worker.qmt_data_push_worker import QmtDataPushWorker
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +111,13 @@ async def lifespan(app: FastAPI):
     )
     worker_tasks.extend(status_worker.start())
 
+    data_push_worker = QmtDataPushWorker(
+        redis_client=redis_client,
+        qmt_service=qmt_service,
+    )
+    worker_tasks.extend(data_push_worker.start())
+    app.state.data_push_worker = data_push_worker
+
     logger.info("All workers started ({} tasks)", len(worker_tasks))
 
     yield
@@ -154,6 +165,26 @@ app.add_middleware(
 from backend.api.qmt import router as qmt_router
 app.include_router(qmt_router, prefix="/api/v1")
 
+# ---------------------------------------------------------------------------
+# SPA 静态文件托管
+# ---------------------------------------------------------------------------
+
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+@app.get("/")
+async def serve_index():
+    """SPA 入口。"""
+    index_file = _STATIC_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
+    return {"message": "Alpha QMT Backend API", "docs": "/docs"}
+
+
+# 必须放在所有路由之后，作为 fallback
+if _STATIC_DIR.exists():
+    app.mount("/assets", StaticFiles(directory=_STATIC_DIR / "assets"), name="static_assets")
+
 
 # ---------------------------------------------------------------------------
 # WebSocket 端点
@@ -169,6 +200,67 @@ async def ws_qmt_status(websocket: WebSocket):
             await websocket.receive_text()
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket, "qmt_status")
+
+
+@app.websocket("/ws/qmt-data")
+async def ws_qmt_data(websocket: WebSocket):
+    """账户数据推送 WebSocket 端点。"""
+    await websocket.accept()
+    push_worker: QmtDataPushWorker | None = getattr(websocket.app.state, "data_push_worker", None)
+    if not push_worker:
+        await websocket.close(code=1011, reason="Data push worker not ready")
+        return
+
+    queue: asyncio.Queue = asyncio.Queue()
+    push_worker.add_connection(queue)
+    logger.info("ws/qmt-data client connected, total={}", len(push_worker._connections))
+
+    # 推送初始快照
+    await push_worker.send_initial_snapshot(queue)
+
+    async def _sender():
+        """从 queue 取消息发送给客户端。"""
+        try:
+            while True:
+                msg = await queue.get()
+                await websocket.send_json(msg)
+        except Exception:
+            pass
+
+    async def _receiver():
+        """接收客户端消息（订阅控制 + 心跳）。"""
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                try:
+                    msg = json.loads(raw)
+                    action = msg.get("action")
+                    if action == "subscribe":
+                        types = set(msg.get("types", []))
+                        push_worker.update_subscriptions(queue, types)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        except Exception:
+            pass
+
+    try:
+        sender_task = asyncio.create_task(_sender())
+        receiver_task = asyncio.create_task(_receiver())
+        done, pending = await asyncio.wait(
+            [sender_task, receiver_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+    except Exception:
+        pass
+    finally:
+        push_worker.remove_connection(queue)
+        logger.info("ws/qmt-data client disconnected")
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

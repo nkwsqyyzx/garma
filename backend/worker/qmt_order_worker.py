@@ -7,6 +7,7 @@ import redis
 from loguru import logger
 
 from backend.config import KEY_EVENT_ORDER_UPDATE
+from backend.worker.trading_hours import is_trading_hours, seconds_until_trading_start
 
 GROUP_NAME = "alpha-order-worker"
 CONSUMER_NAME = "worker-1"
@@ -56,6 +57,13 @@ class QmtOrderWorker:
     async def _run(self) -> None:
         await asyncio.to_thread(self._ensure_group)
         while self._running:
+            # 非交易时间挂起
+            if not is_trading_hours():
+                wait = seconds_until_trading_start()
+                logger.debug("OrderWorker: outside trading hours, sleeping {:.0f}s", wait)
+                await asyncio.sleep(min(wait, 60))
+                continue
+
             try:
                 # XREADGROUP 阻塞 5000ms
                 results = await asyncio.to_thread(

@@ -78,6 +78,17 @@ async def quote_kline(
     return _api_ok(data)
 
 
+@router.get("/quote/stock_names")
+async def quote_stock_names(
+    codes: str = Query(..., description="逗号分隔的股票代码"),
+    svc: QmtService = Depends(get_qmt_service),
+):
+    """批量查询股票名称。"""
+    code_list = [c.strip() for c in codes.split(",") if c.strip()]
+    data = await svc.get_stock_names(code_list)
+    return _api_ok(data)
+
+
 # ===========================================================================
 # 账户（4 个）
 # ===========================================================================

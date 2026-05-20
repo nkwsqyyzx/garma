@@ -32,3 +32,9 @@ logs/**/*.log
 Thumbs.db
 .claude
 .env
+
+# Frontend build output
+backend/static/
+
+# Node
+frontend/node_modules/

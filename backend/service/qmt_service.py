@@ -6,6 +6,7 @@
 - HTTP 转发调试/控制请求
 """
 
+import gzip
 import json
 import math
 import pickle
@@ -132,6 +133,45 @@ class QmtService:
         except httpx.HTTPError as e:
             logger.error("Kline proxy failed: {}", e)
             return []
+
+    # ------------------------------------------------------------------
+    # 股票名称查询
+    # ------------------------------------------------------------------
+
+    _stock_name_cache: dict[str, str] = {}
+    _stock_name_cache_date: str = ""
+
+    async def get_stock_names(self, codes: list[str]) -> dict[str, str]:
+        """从 Redis 读取股票基础信息，返回 {code: name} 映射。"""
+        import asyncio as _aio
+        today = date.today().isoformat()
+
+        # 每日刷新缓存
+        if self._stock_name_cache_date != today:
+            self._stock_name_cache = {}
+            self._stock_name_cache_date = today
+
+        if not self._stock_name_cache:
+            def _load():
+                raw = self._tick_redis.get("股票基础信息")
+                if not raw:
+                    return {}
+                try:
+                    data = pickle.loads(gzip.decompress(raw))
+                    if isinstance(data, dict):
+                        names_dict = data.get("股票名称")
+                        if isinstance(names_dict, dict):
+                            return names_dict  # {code: name} already
+                except Exception as e:
+                    logger.error("Failed to load stock names from Redis: {}", e)
+                return {}
+
+            cache = await _aio.to_thread(_load)
+            self._stock_name_cache = cache
+
+        if not codes:
+            return {}
+        return {c: self._stock_name_cache.get(c, "") for c in codes}
 
     # ------------------------------------------------------------------
     # Redis-first 读取（账户）

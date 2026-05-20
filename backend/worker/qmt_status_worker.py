@@ -9,6 +9,7 @@ import redis
 from loguru import logger
 
 from backend.config import KEY_MARKET_STATUS, KEY_TRADE_STATUS, KEY_STATUS_NOTIFY
+from backend.worker.trading_hours import is_trading_hours, seconds_until_trading_start
 
 
 class QmtStatusWorker:
@@ -78,8 +79,14 @@ class QmtStatusWorker:
                     pass
 
     async def _poll_loop(self) -> None:
-        """每 15s 轮询 qmt:market:status + qmt:trade:status。"""
+        """每 15s 轮询 qmt:market:status + qmt:trade:status。仅交易时间运行。"""
         while self._running:
+            if not is_trading_hours():
+                wait = seconds_until_trading_start()
+                logger.debug("StatusWorker: outside trading hours, sleeping {:.0f}s", wait)
+                await asyncio.sleep(min(wait, 60))
+                continue
+
             try:
                 await self._poll_status()
             except Exception:
