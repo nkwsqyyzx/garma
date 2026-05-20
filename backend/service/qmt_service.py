@@ -58,6 +58,13 @@ class QmtService:
             timeout=config.QMT_SERVER_TIMEOUT,
             headers={"X-API-Key": config.QMT_SERVER_API_KEY},
         )
+        if config.QMT_MARKET_URL:
+            self._market_http = httpx.AsyncClient(
+                base_url=config.QMT_MARKET_URL,
+                timeout=config.QMT_SERVER_TIMEOUT,
+            )
+        else:
+            self._market_http = None
         # 行情 pickle 数据需要 decode_responses=False，单独创建连接
         self._tick_redis = redis.Redis.from_url(
             config.REDIS_URL,
@@ -110,8 +117,21 @@ class QmtService:
             return None
 
     async def get_kline(self, code: str, period: str, count: int) -> list[dict]:
-        """获取 K 线数据（旧实现无 K 线缓存，返回空）。"""
-        return []
+        """获取 K 线数据，代理到 qmt-market 服务。"""
+        if not self._market_http:
+            return []
+        try:
+            resp = await self._market_http.get(
+                "/quote/kline",
+                params={"code": code, "period": period, "count": count},
+            )
+            data = resp.json()
+            if data.get("code") == 0:
+                return data.get("data") or []
+            return []
+        except httpx.HTTPError as e:
+            logger.error("Kline proxy failed: {}", e)
+            return []
 
     # ------------------------------------------------------------------
     # Redis-first 读取（账户）
@@ -284,11 +304,12 @@ class QmtService:
         if market_raw:
             try:
                 d = json.loads(market_raw) if isinstance(market_raw, str) else market_raw
+                overall = d.get("overall_status", "unknown")
                 market_status = QmtServiceStatus(
                     source="market",
-                    status=d.get("status", "unknown"),
-                    level=d.get("level", "offline"),
-                    last_heartbeat=d.get("last_heartbeat"),
+                    status=overall,
+                    level="offline" if overall == "offline" else overall,
+                    last_heartbeat=d.get("server_time"),
                 )
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
@@ -296,11 +317,12 @@ class QmtService:
         if trade_raw:
             try:
                 d = json.loads(trade_raw) if isinstance(trade_raw, str) else trade_raw
+                overall = d.get("overall_status", "unknown")
                 trade_status = QmtServiceStatus(
                     source="trade",
-                    status=d.get("status", "unknown"),
-                    level=d.get("level", "offline"),
-                    last_heartbeat=d.get("last_heartbeat"),
+                    status=overall,
+                    level="offline" if overall == "offline" else overall,
+                    last_heartbeat=d.get("server_time"),
                 )
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
@@ -406,6 +428,8 @@ class QmtService:
 
     async def close(self) -> None:
         await self._http.aclose()
+        if self._market_http:
+            await self._market_http.aclose()
         self._tick_redis.close()
 
 

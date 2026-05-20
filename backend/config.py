@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     QMT_SERVER_API_KEY: str = ""
     QMT_SERVER_TIMEOUT: int = 10
 
+    # QMT Market 行情服务
+    QMT_MARKET_URL: str = ""
+
     # 功能开关
     QMT_TRADE_ENABLED: bool = True
 
