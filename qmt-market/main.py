@@ -1,6 +1,8 @@
 """
-qmt-market 行情服务启动入口。
-FastAPI :8091 + MarketHub 后台线程 + StatusReporter 定时上报。
+qmt-market 行情查询服务启动入口。
+FastAPI + MarketHub（xtdata 同步查询）+ StatusReporter 定时上报。
+
+行情订阅已由旧实现（qmt_tick.py）接管，本服务仅提供按需查询 API。
 
 启动方式: python qmt-market/main.py
 """
@@ -25,7 +27,7 @@ class _ShanghaiFormatter(logging.Formatter):
         return dt.strftime("%Y-%m-%d %H:%M:%S") + f",{int(record.msecs):03d}"
 
 # ---- sys.path 设置 ----
-# 1. 项目根目录（qmt-server/）→ 使 shared 模块可被 import
+# 1. 项目根目录（garma/）→ 使 shared 模块可被 import
 _BASE_DIR = Path(__file__).resolve().parent.parent
 if str(_BASE_DIR) not in sys.path:
     sys.path.insert(0, str(_BASE_DIR))
@@ -77,69 +79,6 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             base[key] = value
     return base
-
-
-# ------------------------------------------------------------------
-# WebSocket 推送（行情服务 :8091）
-# ------------------------------------------------------------------
-
-async def _ws_quote_handler(websocket):
-    """
-    WebSocket 行情推送：
-    客户端发送 {"action": "subscribe", "codes": ["600519.SH"]}
-    服务端推送 {"type": "tick", "code": "600519.SH", "data": {...}, "ts": ...}
-    """
-    import asyncio
-    import time
-
-    await websocket.accept()
-    subscribed_codes = set()
-    hub: MarketHub = websocket.app.state.market_hub
-
-    try:
-        while True:
-            try:
-                raw = await asyncio.wait_for(websocket.receive_text(), timeout=30)
-                msg = json.loads(raw)
-                action = msg.get("action")
-
-                if action == "subscribe":
-                    codes = msg.get("codes", [])
-                    subscribed_codes.update(codes)
-                    await websocket.send_json({
-                        "type": "subscribed",
-                        "codes": list(subscribed_codes),
-                    })
-                elif action == "unsubscribe":
-                    codes = msg.get("codes", [])
-                    subscribed_codes -= set(codes)
-                    await websocket.send_json({
-                        "type": "unsubscribed",
-                        "codes": list(subscribed_codes),
-                    })
-            except asyncio.TimeoutError:
-                # 发心跳
-                await websocket.send_json({"type": "ping", "ts": time.time()})
-                continue
-
-            # 推送订阅的行情
-            if subscribed_codes:
-                ticks = hub.get_ticks_batch(list(subscribed_codes))
-                now = time.time()
-                for code, tick in ticks.items():
-                    await websocket.send_json({
-                        "type": "tick",
-                        "code": code,
-                        "data": tick,
-                        "ts": now,
-                    })
-    except Exception:
-        pass
-    finally:
-        try:
-            await websocket.close()
-        except Exception:
-            pass
 
 
 # ------------------------------------------------------------------
@@ -205,7 +144,7 @@ async def lifespan(app: FastAPI):
     logger.info("[OK] StatusReporter 启动完成")
 
     market_cfg = config.get("market_server", {})
-    port = market_cfg.get("port", 8091)
+    port = market_cfg.get("port", 3301)
     logger.info("[STARTUP] qmt-market 启动完成，监听 :%d", port)
 
     yield  # ---- 应用运行中 ----
@@ -213,12 +152,12 @@ async def lifespan(app: FastAPI):
     # ---- Shutdown（优雅关机）----
     logger.info("[SHUTDOWN] qmt-market 正在关机 ...")
 
-    # 1. 停止接受新请求（FastAPI shutdown 事件自动处理）
-    # 2. 设置 _running = False，通知后台线程退出
+    # 1. 停止 StatusReporter
     reporter: StatusReporter = app.state.status_reporter
     if reporter:
         reporter.stop()
 
+    # 2. 停止 MarketHub
     hub: MarketHub = app.state.market_hub
     if hub:
         hub.stop()
@@ -236,9 +175,7 @@ async def lifespan(app: FastAPI):
             ex=10,
         )
 
-    # 5. 断开 xtdata 连接（hub.stop 已处理）
-
-    # 6. 关闭 Redis 连接池
+    # 5. 关闭 Redis 连接池
     if redis_bridge:
         redis_bridge.close()
 
@@ -250,8 +187,8 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="QMT Market Service",
-        description="A 股行情服务（xtdata → Redis Stream）",
-        version="1.0.0",
+        description="A 股行情查询服务（xtdata 按需查询）",
+        version="2.0.0",
         lifespan=lifespan,
     )
 
@@ -264,13 +201,6 @@ def create_app() -> FastAPI:
     # 注册路由
     app.include_router(create_router())
     app.include_router(_create_control_router())
-
-    # WebSocket 路由
-    from fastapi import WebSocket
-
-    @app.websocket("/ws/quote")
-    async def ws_quote(websocket: WebSocket):
-        await _ws_quote_handler(websocket)
 
     return app
 
@@ -308,7 +238,7 @@ def main():
         ))
 
     host = server_cfg.get("host", "0.0.0.0")
-    port = market_cfg.get("port", 8091)
+    port = market_cfg.get("port", 3301)
 
     logger.info("Starting qmt-market on %s:%d", host, port)
     uvicorn.run(

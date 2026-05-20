@@ -11,13 +11,6 @@ from typing import Optional
 import redis
 
 from .const import (
-    KEY_SUB_POOL,
-    KEY_SNAPSHOT_TICK,
-    KEY_SNAPSHOT_KLINE,
-    KEY_STREAM_TICK,
-    KEY_STREAM_AGG,
-    KEY_STREAM_KLINE,
-    KEY_MARKET_LAST_UPDATED,
     KEY_CMD_QUEUE,
     KEY_CMD_QUEUE_BACKUP,
     KEY_CMD_DLQ,
@@ -96,157 +89,6 @@ class RedisBridge:
             return self._redis.llen(key)
         except redis.RedisError:
             return -1
-
-    # ------------------------------------------------------------------
-    # 行情写入（MarketHub 使用）
-    # ------------------------------------------------------------------
-
-    def publish_tick(self, code: str, payload: dict,
-                     tick_maxlen: int = 500, agg_maxlen: int = 50000,
-                     include_heartbeat: bool = False) -> None:
-        """
-        写入 Tick 数据，使用 Pipeline 批量提交（3-4 次写操作合并为 1 RTT）：
-        1. HSET qmt:snapshot:tick code payload
-        2. XADD qmt:stream:tick:{code} payload
-        3. XADD qmt:stream:agg {code, data}
-        4. SET qmt:market:last_updated timestamp（仅 include_heartbeat=True 时）
-        """
-        try:
-            pipe = self._redis.pipeline()
-            payload_json = json.dumps(payload, ensure_ascii=False)
-
-            # 1. 写入快照 Hash
-            pipe.hset(KEY_SNAPSHOT_TICK, code, payload_json)
-
-            # 2. 写入个股 Stream
-            stream_tick_key = KEY_STREAM_TICK.format(code=code)
-            stream_fields = {k: str(v) for k, v in payload.items()}
-            pipe.xadd(stream_tick_key, stream_fields,
-                      maxlen=tick_maxlen, approximate=True)
-
-            # 3. 写入聚合 Stream
-            pipe.xadd(KEY_STREAM_AGG,
-                      {"code": code, "data": payload_json},
-                      maxlen=agg_maxlen, approximate=True)
-
-            # 4. 心跳（节流，由 MarketHub 控制）
-            if include_heartbeat:
-                pipe.set(KEY_MARKET_LAST_UPDATED, str(time.time()))
-
-            pipe.execute()
-        except redis.RedisError:
-            logger.error("[ERROR] publish_tick 写 Redis 失败", exc_info=True)
-
-    def update_last_heartbeat(self) -> None:
-        """更新行情心跳时间戳"""
-        try:
-            self._redis.set(KEY_MARKET_LAST_UPDATED, str(time.time()))
-        except redis.RedisError:
-            logger.error("[ERROR] update_last_heartbeat 失败", exc_info=True)
-
-    def publish_kline(self, code: str, period: str, payload: dict,
-                      maxlen: int = 1000) -> None:
-        """写入 K 线数据"""
-        try:
-            pipe = self._redis.pipeline()
-            payload_json = json.dumps(payload, ensure_ascii=False)
-
-            # 写入 K 线快照 Hash
-            kline_hash_key = KEY_SNAPSHOT_KLINE.format(period=period)
-            pipe.hset(kline_hash_key, code, payload_json)
-
-            # 写入 K 线 Stream
-            stream_kline_key = KEY_STREAM_KLINE.format(period=period, code=code)
-            stream_fields = {k: str(v) for k, v in payload.items()}
-            pipe.xadd(stream_kline_key, stream_fields,
-                      maxlen=maxlen, approximate=True)
-
-            pipe.execute()
-        except redis.RedisError:
-            logger.error("[ERROR] publish_kline 写 Redis 失败", exc_info=True)
-
-    # ------------------------------------------------------------------
-    # 订阅池操作
-    # ------------------------------------------------------------------
-
-    def get_sub_pool(self) -> dict:
-        """读取订阅池 qmt:sub:pool → {code: info_json}"""
-        try:
-            return self._redis.hgetall(KEY_SUB_POOL)
-        except redis.RedisError:
-            return {}
-
-    def add_to_sub_pool(self, code: str, source: str = "api") -> None:
-        try:
-            info = json.dumps({
-                "added_at": time.time(),
-                "source": source,
-            }, ensure_ascii=False)
-            self._redis.hset(KEY_SUB_POOL, code, info)
-        except redis.RedisError:
-            logger.error("[ERROR] add_to_sub_pool 失败", exc_info=True)
-
-    def remove_from_sub_pool(self, code: str) -> None:
-        try:
-            self._redis.hdel(KEY_SUB_POOL, code)
-        except redis.RedisError:
-            logger.error("[ERROR] remove_from_sub_pool 失败", exc_info=True)
-
-    def clear_sub_pool(self) -> int:
-        """清空订阅池，返回删除数量"""
-        try:
-            return self._redis.delete(KEY_SUB_POOL)
-        except redis.RedisError:
-            return 0
-
-    def get_sub_count(self) -> int:
-        try:
-            return self._redis.hlen(KEY_SUB_POOL)
-        except redis.RedisError:
-            return 0
-
-    # ------------------------------------------------------------------
-    # 行情读取
-    # ------------------------------------------------------------------
-
-    def get_tick_snapshot(self, code: str) -> Optional[dict]:
-        """从 Redis Hash 读取单只股票最新 Tick"""
-        try:
-            raw = self._redis.hget(KEY_SNAPSHOT_TICK, code)
-            if raw is None:
-                return None
-            return json.loads(raw)
-        except (redis.RedisError, json.JSONDecodeError):
-            return None
-
-    def get_tick_snapshots_batch(self, codes: list[str]) -> dict:
-        """批量读取 Tick 快照"""
-        try:
-            raws = self._redis.hmget(KEY_SNAPSHOT_TICK, codes)
-            result = {}
-            for code, raw in zip(codes, raws):
-                if raw:
-                    try:
-                        result[code] = json.loads(raw)
-                    except json.JSONDecodeError:
-                        pass
-            return result
-        except redis.RedisError:
-            return {}
-
-    def get_all_tick_snapshots(self) -> dict:
-        """读取全部 Tick 快照"""
-        try:
-            raw_map = self._redis.hgetall(KEY_SNAPSHOT_TICK)
-            result = {}
-            for code, raw in raw_map.items():
-                try:
-                    result[code] = json.loads(raw)
-                except json.JSONDecodeError:
-                    pass
-            return result
-        except redis.RedisError:
-            return {}
 
     # ------------------------------------------------------------------
     # 交易命令队列
@@ -476,15 +318,6 @@ class RedisBridge:
         except redis.RedisError:
             logger.error("[ERROR] publish_status 失败", exc_info=True)
 
-    def set_component_status(self, component: str, status: str) -> None:
-        """更新单个子系统状态（紧急场景使用）"""
-        try:
-            # 读取当前状态，更新对应组件，写回
-            # 此方法主要用于 on_disconnected 等紧急场景
-            pass
-        except redis.RedisError:
-            logger.error("[ERROR] set_component_status 失败", exc_info=True)
-
     def push_alert_history(self, alert: dict) -> None:
         """写入告警历史"""
         try:
@@ -507,8 +340,13 @@ class RedisBridge:
         return raw if isinstance(raw, list) else None
 
     def get_account_orders(self) -> Optional[list]:
-        raw = self.get_json(KEY_ACCOUNT_ORDERS)
-        return raw if isinstance(raw, list) else None
+        raw = self._redis.get(KEY_ACCOUNT_ORDERS)
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except (redis.RedisError, json.JSONDecodeError):
+            return None
 
     def get_account_trades(self) -> Optional[list]:
         raw = self.get_json(KEY_ACCOUNT_TRADES)

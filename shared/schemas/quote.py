@@ -89,28 +89,6 @@ class KlineData(BaseModel):
 # HTTP 请求/响应模型
 # ============================================================
 
-class SubscribeAddRequest(BaseModel):
-    """添加订阅请求"""
-    codes: list[str] = Field(..., description="股票代码列表", min_length=1)
-
-
-class SubscribeRemoveRequest(BaseModel):
-    """取消订阅请求"""
-    codes: list[str] = Field(..., description="股票代码列表", min_length=1)
-
-
-class QuoteTickBatchRequest(BaseModel):
-    """批量查询 Tick 请求"""
-    codes: list[str] = Field(..., description="股票代码列表（最多 50 只）", min_length=1)
-
-
-class QuoteKlineRequest(BaseModel):
-    """K 线查询请求"""
-    code: str = Field(..., description="股票代码")
-    period: str = Field("1d", description="K 线周期：1m / 5m / 1d 等")
-    count: int = Field(100, description="返回条数", ge=1, le=1000)
-
-
 class QuoteHistoryRequest(BaseModel):
     """历史行情下载请求"""
     code: str = Field(..., description="股票代码")

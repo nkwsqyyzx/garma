@@ -7,15 +7,6 @@
 # Redis 键前缀与模板
 # ============================================================
 
-# --- 行情相关 ---
-KEY_SUB_POOL = "qmt:sub:pool"  # Hash: 订阅池
-KEY_SNAPSHOT_TICK = "qmt:snapshot:tick"  # Hash: 最新 Tick 快照
-KEY_SNAPSHOT_KLINE = "qmt:snapshot:kline:{period}"  # Hash: 最新 K 线快照
-KEY_STREAM_TICK = "qmt:stream:tick:{code}"  # Stream: 单股 Tick
-KEY_STREAM_AGG = "qmt:stream:agg"  # Stream: 聚合行情
-KEY_STREAM_KLINE = "qmt:stream:kline:{period}:{code}"  # Stream: K 线
-KEY_MARKET_LAST_UPDATED = "qmt:market:last_updated"  # String: 最后行情更新时间
-
 # --- 交易相关 ---
 KEY_CMD_QUEUE = "qmt:cmd:queue"  # List: 交易命令队列
 KEY_CMD_QUEUE_BACKUP = "qmt:cmd:queue:backup"  # List: 消费中备份
@@ -39,7 +30,6 @@ KEY_STATUS_ALERTS = "qmt:status:alerts"  # List: 告警历史
 
 # --- 控制 ---
 KEY_KILL_SWITCH = "qmt:kill_switch"  # String: 熔断开关
-KEY_CONFIG_SUB_LIMIT = "qmt:config:sub_limit"  # String: 最大订阅数
 
 # ============================================================
 # 订单状态映射（xtquant → 系统规范）
@@ -85,7 +75,6 @@ class ErrorCode:
     MARKET_NOT_CONNECTED = 1002
     TRADE_NOT_CONNECTED = 1003
     ACCOUNT_NOT_LOGGED_IN = 1004
-    SUBSCRIBE_LIMIT_EXCEEDED = 1005
     RISK_REJECTED = 2001
     ORDER_FAILED = 2002
     INTERNAL_ERROR = 5000
@@ -105,8 +94,6 @@ class StatusLevel:
 # 告警阈值
 # ============================================================
 
-TICK_STALE_SECONDS = 60  # 行情超过 60s 无推送 → degraded
-TICK_OFFLINE_SECONDS = 120  # 超过 120s → offline
 REDIS_LATENCY_WARN_MS = 100  # Redis 延迟超过 100ms → degraded
 STATUS_TTL_SECONDS = 35  # Redis 状态键 TTL（比上报周期多 5s）
 ALERT_HISTORY_MAX = 200  # 告警历史最多保留条数

@@ -15,7 +15,6 @@ from loguru import logger
 from backend.config import get_settings
 from backend.database import init_db, close_db
 from backend.service.qmt_service import QmtService
-from backend.worker.qmt_market_worker import QmtMarketWorker
 from backend.worker.qmt_order_worker import QmtOrderWorker
 from backend.worker.qmt_status_worker import QmtStatusWorker
 
@@ -69,7 +68,7 @@ async def lifespan(app: FastAPI):
     """Startup / Shutdown 生命周期管理。"""
     settings = get_settings()
 
-    # 1. 创建 Redis 连接（同步 redis.Redis，Workers 共享）
+    # 1. 创建 Redis 连接（db0）
     redis_client = redis.Redis.from_url(
         settings.REDIS_URL,
         decode_responses=True,
@@ -95,13 +94,6 @@ async def lifespan(app: FastAPI):
 
     # 4. 启动 Workers
     worker_tasks = []
-
-    if settings.QMT_MARKET_ENABLED:
-        market_worker = QmtMarketWorker(
-            redis_client=redis_client,
-            ws_broadcaster=ws_manager.broadcast,
-        )
-        worker_tasks.append(market_worker.start())
 
     order_worker = QmtOrderWorker(
         redis_client=redis_client,
@@ -177,17 +169,6 @@ async def ws_qmt_status(websocket: WebSocket):
             await websocket.receive_text()
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket, "qmt_status")
-
-
-@app.websocket("/ws/qmt-tick")
-async def ws_qmt_tick(websocket: WebSocket):
-    """QMT 行情 Tick WebSocket 端点。"""
-    await ws_manager.connect(websocket, "qmt_tick")
-    try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        ws_manager.disconnect(websocket, "qmt_tick")
 
 
 # ---------------------------------------------------------------------------

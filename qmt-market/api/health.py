@@ -1,5 +1,5 @@
 """
-健康检查 API：/health（xtdata 状态 + Redis 状态）
+健康检查 API：/health（xtdata 连接 + Redis 连通性）
 """
 
 import logging
@@ -14,7 +14,7 @@ router = APIRouter(tags=["health"])
 
 @router.get("/health")
 async def health_check(request: Request):
-    """行情服务健康状态（xtdata 连接 + Redis + 订阅数）"""
+    """行情服务健康状态（xtdata 连接 + Redis 连通性）"""
     reporter = request.app.state.status_reporter
     status = reporter.latest_status
     return ApiResponse(code=0, msg="ok", data=status)

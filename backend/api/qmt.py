@@ -1,4 +1,4 @@
-"""QMT API 路由 —— 全部 24 个端点。"""
+"""QMT API 路由。"""
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -40,7 +40,7 @@ def _api_error(code: int, msg: str) -> dict:
 
 
 # ===========================================================================
-# 行情（5 个）
+# 行情（3 个）
 # ===========================================================================
 
 @router.get("/quote/snapshot")
@@ -76,64 +76,6 @@ async def quote_kline(
     """查询 K 线。"""
     data = await svc.get_kline(code, period, count)
     return _api_ok(data)
-
-
-@router.get("/quote/detail/{code}")
-async def quote_detail(
-    code: str,
-    svc: QmtService = Depends(get_qmt_service),
-):
-    """股票基本信息（转发到 QMT 行情服务 :8091）。"""
-    data = await svc.forward_to_market("GET", f"/api/v1/quote/detail/{code}")
-    return data
-
-
-@router.get("/quote/sector/{sector}")
-async def quote_sector(
-    sector: str,
-    svc: QmtService = Depends(get_qmt_service),
-):
-    """板块成分股列表（转发到 :8091）。"""
-    data = await svc.forward_to_market("GET", f"/api/v1/quote/sector/{sector}")
-    return data
-
-
-# ===========================================================================
-# 订阅管理（4 个）
-# ===========================================================================
-
-@router.get("/subscribe")
-async def list_subscribe(
-    svc: QmtService = Depends(get_qmt_service),
-):
-    """当前订阅列表。"""
-    return await svc.forward_to_market("GET", "/api/v1/subscribe")
-
-
-@router.post("/subscribe/add")
-async def add_subscribe(
-    codes: list[str],
-    svc: QmtService = Depends(get_qmt_service),
-):
-    """添加订阅。"""
-    return await svc.forward_to_market("POST", "/api/v1/subscribe/add", body={"codes": codes})
-
-
-@router.post("/subscribe/remove")
-async def remove_subscribe(
-    codes: list[str],
-    svc: QmtService = Depends(get_qmt_service),
-):
-    """移除订阅。"""
-    return await svc.forward_to_market("POST", "/api/v1/subscribe/remove", body={"codes": codes})
-
-
-@router.delete("/subscribe")
-async def clear_subscribe(
-    svc: QmtService = Depends(get_qmt_service),
-):
-    """清空所有订阅。"""
-    return await svc.forward_to_market("DELETE", "/api/v1/subscribe")
 
 
 # ===========================================================================
@@ -294,7 +236,7 @@ async def get_config():
     settings = get_settings()
     return _api_ok(QmtConfigResponse(
         qmt_server_url=settings.QMT_SERVER_URL,
-        qmt_market_enabled=settings.QMT_MARKET_ENABLED,
+        qmt_market_enabled=settings.QMT_TRADE_ENABLED,  # 保留字段兼容前端，用 TRADE 值
         qmt_trade_enabled=settings.QMT_TRADE_ENABLED,
         qmt_account_id=settings.QMT_ACCOUNT_ID,
         qmt_server_timeout=settings.QMT_SERVER_TIMEOUT,

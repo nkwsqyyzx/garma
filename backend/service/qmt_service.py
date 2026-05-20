@@ -8,8 +8,10 @@
 
 import json
 import math
+import pickle
 import time
 import uuid
+from datetime import date
 from typing import Any
 
 import httpx
@@ -17,12 +19,8 @@ import redis
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from backend.config import (
     Settings,
-    KEY_SNAPSHOT_TICK,
-    KEY_SNAPSHOT_KLINE,
     KEY_ACCOUNT_ASSET,
     KEY_ACCOUNT_POSITIONS,
     KEY_ACCOUNT_ORDERS,
@@ -60,53 +58,60 @@ class QmtService:
             timeout=config.QMT_SERVER_TIMEOUT,
             headers={"X-API-Key": config.QMT_SERVER_API_KEY},
         )
+        # 行情 pickle 数据需要 decode_responses=False，单独创建连接
+        self._tick_redis = redis.Redis.from_url(
+            config.REDIS_URL,
+            decode_responses=False,
+            socket_timeout=3,
+            socket_connect_timeout=5,
+        )
 
     # ------------------------------------------------------------------
-    # Redis-first 读取（行情）
+    # 旧行情 Redis 读取（qmt_tick:{date}:{code}）
     # ------------------------------------------------------------------
 
     async def get_snapshot(self, codes: list[str]) -> dict:
-        """批量获取 Tick 快照，HMGET qmt:snapshot:tick。"""
+        """批量获取 Tick 快照，从旧行情 Redis 读取最新 tick。"""
         if not codes:
             return {}
         import asyncio as _aio
-        values = await _aio.to_thread(self._redis.hmget, KEY_SNAPSHOT_TICK, *codes)
-        result = {}
-        for code, raw in zip(codes, values):
-            if raw:
+        today = date.today().strftime("%Y%m%d")
+        # pipeline 批量读每个股票的最新一条 tick
+        def _batch_read():
+            pipe = self._tick_redis.pipeline(transaction=False)
+            for code in codes:
+                pipe.lrange(f"qmt_tick:{today}:{code}", -1, -1)
+            return pipe.execute()
+
+        results = await _aio.to_thread(_batch_read)
+        out = {}
+        for code, raw_list in zip(codes, results):
+            if raw_list:
                 try:
-                    data = _sanitize_floats(json.loads(raw) if isinstance(raw, str) else raw)
-                    _enrich_tick(data)
-                    result[code] = data
-                except (json.JSONDecodeError, TypeError):
+                    row = pickle.loads(raw_list[0])
+                    out[code] = _old_tick_to_dict(code, row)
+                except Exception:
                     pass
-        return result
+        return out
 
     async def get_tick(self, code: str) -> dict | None:
         """获取单只股票最新 Tick。"""
-        raw = await self._redis_hget(KEY_SNAPSHOT_TICK, code)
-        if not raw:
+        import asyncio as _aio
+        today = date.today().strftime("%Y%m%d")
+        raw_list = await _aio.to_thread(
+            self._tick_redis.lrange, f"qmt_tick:{today}:{code}", -1, -1
+        )
+        if not raw_list:
             return None
         try:
-            data = _sanitize_floats(json.loads(raw) if isinstance(raw, str) else raw)
-            _enrich_tick(data)
-            return data
-        except (json.JSONDecodeError, TypeError):
+            row = pickle.loads(raw_list[0])
+            return _old_tick_to_dict(code, row)
+        except Exception:
             return None
 
     async def get_kline(self, code: str, period: str, count: int) -> list[dict]:
-        """获取 K 线数据。"""
-        key = KEY_SNAPSHOT_KLINE.format(period=period)
-        raw = await self._redis_hget(key, code)
-        if not raw:
-            return []
-        try:
-            data = json.loads(raw) if isinstance(raw, str) else raw
-            if isinstance(data, list):
-                return _sanitize_floats(data[-count:])
-            return [_sanitize_floats(data)]
-        except (json.JSONDecodeError, TypeError):
-            return []
+        """获取 K 线数据（旧实现无 K 线缓存，返回空）。"""
+        return []
 
     # ------------------------------------------------------------------
     # Redis-first 读取（账户）
@@ -264,30 +269,6 @@ class QmtService:
             logger.error("Proxy request failed: {} {} → {}", method, path, e)
             return {"code": 502, "msg": f"QMT-Server request failed: {e}"}
 
-    async def forward_to_market(self, method: str, path: str,
-                                params: dict | None = None,
-                                body: dict | None = None) -> dict:
-        """转发请求到 QMT 行情服务。"""
-        market_url = self._config.QMT_MARKET_URL
-        if not market_url:
-            market_url = self._config.QMT_SERVER_URL.replace(":8090", ":8091")
-        try:
-            async with httpx.AsyncClient(
-                base_url=market_url,
-                timeout=self._config.QMT_SERVER_TIMEOUT,
-                headers={"X-API-Key": self._config.QMT_SERVER_API_KEY},
-            ) as client:
-                resp = await client.request(
-                    method=method.upper(),
-                    url=path,
-                    params=params,
-                    json=body,
-                )
-                return resp.json()
-        except httpx.HTTPError as e:
-            logger.error("Forward to market failed: {} {} → {}", method, path, e)
-            return {"code": 502, "msg": f"QMT-Market request failed: {e}"}
-
     # ------------------------------------------------------------------
     # 状态检查
     # ------------------------------------------------------------------
@@ -405,14 +386,6 @@ class QmtService:
         import asyncio
         await asyncio.to_thread(self._redis.delete, key)
 
-    async def _redis_hget(self, key: str, field: str) -> str | None:
-        import asyncio
-        return await asyncio.to_thread(self._redis.hget, key, field)
-
-    async def _redis_hgetall(self, key: str) -> dict:
-        import asyncio
-        return await asyncio.to_thread(self._redis.hgetall, key)
-
     async def _redis_lpush(self, key: str, value: str) -> None:
         import asyncio
         await asyncio.to_thread(self._redis.lpush, key, value)
@@ -433,6 +406,7 @@ class QmtService:
 
     async def close(self) -> None:
         await self._http.aclose()
+        self._tick_redis.close()
 
 
 def _sanitize_floats(obj):
@@ -448,14 +422,37 @@ def _sanitize_floats(obj):
     return obj
 
 
-def _enrich_tick(data: dict) -> None:
-    """补算上游缺失的 Tick 派生字段（就地修改）。"""
-    if not isinstance(data, dict):
-        return
-    last = data.get("last")
-    close = data.get("close")
-    if last is not None and close and close != 0:
-        if not data.get("change"):
-            data["change"] = round(last - close, 4)
-        if not data.get("pct_change"):
-            data["pct_change"] = round((last - close) / close * 100, 4)
+def _old_tick_to_dict(code: str, row: list) -> dict:
+    """将旧实现 pickle tick 数据转为 API 响应格式。
+
+    row = [time, lastPrice, open, high, low, lastClose, amount, volume,
+           askPrice[5], bidPrice[5], askVol[5], bidVol[5]]
+    """
+    last_price = row[1]
+    last_close = row[5]
+    volume = row[7]
+    change = round(last_price - last_close, 4) if last_close else 0
+    pct_change = round(change / last_close * 100, 4) if last_close else 0
+    avg_price = round(row[6] / (volume * 100), 4) if volume else 0
+    ask_p = row[8] if len(row) > 8 else [0] * 5
+    bid_p = row[9] if len(row) > 9 else [0] * 5
+    ask_v = row[10] if len(row) > 10 else [0] * 5
+    bid_v = row[11] if len(row) > 11 else [0] * 5
+    return {
+        "code": code,
+        "time": row[0],
+        "open": row[2],
+        "high": row[3],
+        "low": row[4],
+        "last": last_price,
+        "close": last_close,
+        "amount": row[6],
+        "volume": volume,
+        "ask1": ask_p[0], "ask2": ask_p[1], "ask3": ask_p[2], "ask4": ask_p[3], "ask5": ask_p[4],
+        "bid1": bid_p[0], "bid2": bid_p[1], "bid3": bid_p[2], "bid4": bid_p[3], "bid5": bid_p[4],
+        "ask_vol1": ask_v[0], "ask_vol2": ask_v[1], "ask_vol3": ask_v[2], "ask_vol4": ask_v[3], "ask_vol5": ask_v[4],
+        "bid_vol1": bid_v[0], "bid_vol2": bid_v[1], "bid_vol3": bid_v[2], "bid_vol4": bid_v[3], "bid_vol5": bid_v[4],
+        "change": change,
+        "pct_change": pct_change,
+        "avg_price": avg_price,
+    }

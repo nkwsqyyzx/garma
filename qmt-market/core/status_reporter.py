@@ -1,6 +1,6 @@
 """
 StatusReporter：行情服务健康上报（每 10s 写 qmt:market:status）。
-独立线程运行，采集 xtdata 连接状态 + Redis 连通性 + 订阅数量。
+独立线程运行，采集 xtdata 连接状态 + Redis 连通性。
 """
 
 import logging
@@ -12,8 +12,6 @@ from typing import Optional
 import pytz
 
 from shared.const import (
-    TICK_STALE_SECONDS,
-    TICK_OFFLINE_SECONDS,
     REDIS_LATENCY_WARN_MS,
 )
 
@@ -101,42 +99,16 @@ class StatusReporter:
 
         # ---- xtdata 状态 ----
         xtdata_connected = self._hub.connected
-        last_tick_at = self._hub.last_tick_at
-        subscribed_count = self._hub.subscribed_count
-        tick_count = self._hub.tick_count
 
         if not xtdata_connected:
             xtdata_status = "offline"
             alerts.append(self._make_alert("xtdata_offline", "error",
                                            "行情连接断开（xtdata 未连接）"))
-        elif last_tick_at > 0:
-            tick_delay = now - last_tick_at
-            if tick_delay > TICK_OFFLINE_SECONDS:
-                xtdata_status = "offline"
-                alerts.append(self._make_alert("xtdata_stale_offline", "error",
-                                               f"行情超过 {TICK_OFFLINE_SECONDS}s 无推送"))
-            elif tick_delay > TICK_STALE_SECONDS:
-                xtdata_status = "degraded"
-                alerts.append(self._make_alert("xtdata_stale", "warning",
-                                               f"行情 {tick_delay:.0f}s 无推送，可能延迟"))
-            else:
-                xtdata_status = "healthy"
         else:
-            # 启动后尚未收到任何 tick，给予 30s 宽限
-            uptime = now - self._start_time
-            if uptime > 60:
-                xtdata_status = "degraded"
-                alerts.append(self._make_alert("xtdata_no_tick", "warning",
-                                               "启动后尚未收到任何行情数据"))
-            else:
-                xtdata_status = "healthy"
+            xtdata_status = "healthy"
 
         xtdata_info = {
             "connected": xtdata_connected,
-            "last_tick_at": last_tick_at if last_tick_at > 0 else None,
-            "last_tick_delay_s": round(now - last_tick_at, 1) if last_tick_at > 0 else None,
-            "subscribed_count": subscribed_count,
-            "tick_count": tick_count,
             "status": xtdata_status,
         }
 
@@ -169,7 +141,7 @@ class StatusReporter:
 
         return {
             "source": "market",
-            "version": "1.0.0",
+            "version": "2.0.0",
             "overall_status": overall,
             "server_time": datetime.now(_BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S"),
             "timestamp": now,

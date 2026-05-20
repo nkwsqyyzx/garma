@@ -1,9 +1,16 @@
 # QMT-Server 技术设计文档
 
-- **版本**：v1.2
-- **日期**：2026-05-08
+- **版本**：v1.3
+- **日期**：2026-05-20
 - **适用系统**：Alpha Finance Terminal + 华泰证券 MiniQMT
 - **状态**：待评审
+
+> v1.3 变更（行情订阅架构调整）：
+> - 行情订阅（全市场 Tick 推送 → Redis）由独立旧实现（qmt_tick.py）接管，数据存储在 Redis db0（pickle 格式）
+> - qmt-market 不再负责行情订阅和实时推送，仅提供 xtdata 按需查询 API（K 线、板块、基本信息、历史下载）
+> - 移除 WebSocket 推送端点（`/ws/quote`）、订阅管理 API（`/subscribe/*`）
+> - 移除 MarketHub 中的 `_on_tick`/`_on_kline` 回调、订阅池管理、Redis Stream 写入
+> - Alpha 后端行情数据直接从旧实现 Redis（db0）读取，不再消费 `qmt:stream:agg`
 
 > v1.2 变更（Section 5 Alpha Finance Terminal 集成审阅修复）：
 > - QmtStatusWorker：修复 `def` → `async def` 方法签名；Pub/Sub 路径同步更新 `_last_hash` 防止轮询重复推送
@@ -24,13 +31,11 @@
 3. [QMT-Server 详细设计（Windows 端）](#3-qmt-server-详细设计windows-端)
     - 3.1 目录结构
     - 3.2 核心模块
-    - 3.3 行情模块
-    - 3.4 交易模块
+    - 3.3 行情模块（按需查询）    - 3.4 交易模块
     - 3.5 XtQuantTraderCallback 回调系统（核心）
     - 3.6 账户模块（事件驱动 + 轮询兜底）
     - 3.7 HTTP API 层（行情 :8091 / 交易 :8090 独立端口）
-    - 3.8 WebSocket 推送层（行情服务 :8091）
-    - 3.9 Redis 桥接层（shared/redis_bridge.py 共享）
+    - 3.8 Redis 桥接层（shared/redis_bridge.py 共享）
 4. [数据协议规范](#4-数据协议规范)
     - 4.1 Redis 键命名规范
     - 4.2 行情数据格式
@@ -102,8 +107,8 @@ A 股量化下单：限价单、市价单、撤单
 │ │ │ │ │ │ │ │
 │ │ │ MarketHub │ │ TradeHub + AccountHub │ │ │
 │ │ │ StatusReporter │ │ CallbackHandler + CmdConsumer │ │ │
-│ │ │ /subscribe │ │ SessionMgr + StatusReporter │ │ │
-│ │ │ /quote /health │ │ /trade /account /health │ │ │
+│ │ │ /quote /health │ │ SessionMgr + StatusReporter │ │ │
+│ │ │ /control │ │ /trade /account /health │ │ │
 │ │ └────────┬───────────┘ └──────────────┬────────────────────┘ │ │
 │ │ │ XADD Stream │ HSET/XADD/BRPOPLPUSH │ │
 │ └───────────┼──────────────────────────────┼───────────────────────┘ │
@@ -112,9 +117,9 @@ A 股量化下单：限价单、市价单、撤单
 │ │ │
 │ （
 Redis 192.168.3.80:6379 ）— 进程间唯一数据边界 │
-│ qmt:stream:agg / qmt:stream:tick:{code} （行情 Stream） │
+│ qmt_tick:{YYYYMMDD}:{code} （旧实现行情数据，db0 pickle） │
 │ qmt:cmd:queue / qmt:event:order_update （交易指令与回报） │
-│ qmt:market:status / qmt:trade:status / qmt:snapshot:* （状态快照） │
+│ qmt:market:status / qmt:trade:status （状态快照） │
 │ │ │
 │ ┌───────────────┤ │
 │ │ │ │
@@ -123,9 +128,9 @@ Redis 192.168.3.80:6379 ）— 进程间唯一数据边界 │
 │ │ （可部署于任意 │ │ │ │
 │ │ 可达 Redis 的 │ │ ┌─────────────────────────────────────┐ │ │
 │ │ 机器） │ │ │ Alpha Finance Terminal │ │ │
-│ │ │ │ │ qmt_service.py qmt_market_worker │ │ │
-│ │ XREAD qmt:          │ │ │ /api/v1/qmt/*      WebSocket 推送 │ │ │
-│ │ stream:agg │ │ └─────────────────────────────────────┘ │ │
+│ │ │ │ │ qmt_service.py qmt_order_worker │ │ │
+│ │ LPUSH qmt:          │ │ │ /api/v1/qmt/*      qmt_status_worker │ │ │
+│ │ cmd:queue │ │ └─────────────────────────────────────┘ │ │
 │ │ LPUSH qmt:          │ │ │ │
 │ │ cmd:queue │ │ ┌─────────────────────────────────────┐ │ │
 │ └─────────────────┘ │ │ Frontend （React） │ │ │
@@ -135,16 +140,16 @@ Redis 192.168.3.80:6379 ）— 进程间唯一数据边界 │
 └────────────────────────────────────────────────────────────────────────┘
 核心设计思想：行情与交易通过 Redis 数据协议完全解耦
 服务 依赖 SDK 端口 Redis 写入 Redis 读取
-qmt- xtdata   :8091 qmt:stream:tick/agg, qmt:snapshot:tick qmt:sub:pool
+qmt- xtdata   :3301 qmt:market:status —
 market only
-qmt- xttrader :8090 qmt:event:order_update, qmt:order:status, qmt:cmd:queue
+qmt- xttrader :3300 qmt:event:order_update, qmt:order:status, qmt:cmd:queue
 trade only qmt:snapshot:asset/position
 
-量化策略接入只需三步：
+量化策略接入只需两步：
 
-## 1. 连接 Redis（192.168.3.80:6379）
+## 1. 连接 Redis（192.168.1.70:6379）
 
-## 2. `XREAD qmt:stream:agg` — 实时接收行情 tick
+## 2. `LRANGE qmt_tick:{YYYYMMDD}:{code} -1 -1` — 读取最新 tick
 
 ## 3. `LPUSH qmt:cmd:queue {JSON}` — 发送交易指令，`XREAD qmt:event:order_update`
 
@@ -152,15 +157,15 @@ trade only qmt:snapshot:asset/position
 
 ### 2.1 数据流说明
 
-行情链路（低延迟推送）
-xtquant 回调（线程）
-→ MarketHub._on_tick()
-→ Redis XADD qmt:stream:tick:{code} （每只股票独立 Stream）
-→ Redis HSET qmt:snapshot:tick （全量快照 Hash，最新 tick）
-→ Redis XADD qmt:stream:agg （聚合 Stream，所有行情广播）
-→ Alpha 后端 QmtMarketWorker
-→ WebSocket 广播前端
-→ 写入 Redis Hash（供 API 直接读取）
+行情链路（旧实现，独立进程）
+xtquant subscribe_whole_quote 回调
+→ qmt_tick.py（独立进程）
+→ Redis db0 LPUSH qmt_tick:{YYYYMMDD}:{code} （pickle 格式，每只股票每日列表）
+→ Alpha 后端 QmtService.get_snapshot / get_tick（直接从 Redis 读取）
+
+行情查询链路（按需查询，qmt-market）
+HTTP 请求 → MarketHub → xtdata.get_full_tick / get_market_data_ex / get_instrument_detail / get_stock_list_in_sector
+→ 直接返回查询结果
 
 交易链路（可靠命令队列）
 Alpha 后端 QmtService.place_order()
@@ -191,21 +196,19 @@ qmt-server/ # 代码仓库根目录
 │ ├── trade.py # 交易命令与回报 Pydantic 模型
 │ └── account.py # 账户资产 / 持仓 / 委托 Pydantic 模型
 │
-├── qmt-market/ # =====行情服务（独立进程）=====
-│ ├── main.py # 启动入口：FastAPI :8091 + MarketHub 后台线
+├── qmt-market/ # =====行情查询服务（独立进程）=====
+│ ├── main.py # 启动入口：FastAPI :3301 + MarketHub
 │ ├── requirements.txt # 仅含 xtdata 所需依赖（无 xttrader）
 │ │
 │ ├── core/
 │ │ ├── __init__.py
-│ │ ├── market_hub.py 订阅管理 + Tick/Kline 回调 → Redis
-# xtdata
+│ │ ├── market_hub.py xtdata 按需查询（K线/板块/基本信息）
 │ │ └── status_reporter.py # 行情服务健康上报（每10s写 qmt:market:status
 │ │
 │ └── api/
 │ ├── __init__.py
 │ ├── router.py # 路由总注册
-│ ├── subscribe.py # 订阅管理：添加/取消/列表/重置
-│ ├── quote.py # 行情查询：最新 tick、历史 K 线、基本信息
+│ ├── quote.py # 行情查询：最新 tick、K 线、基本信息、板块、历史
 │ └── health.py # 健康检查：/health（xtdata 状态 + Redis 状态
 │
 ├── qmt-trade/ # =====交易服务（独立进程）=====
@@ -260,19 +263,17 @@ qmt-server/ # 代码仓库根目录
 #### 3.2.1 行情进程（qmt-market/main.py）
 
 qmt-market/main.py
-├── FastAPI app（HTTP :8091）
-│ ├── /subscribe — 订阅管理（添加/取消/列表）
-│ ├── /quote — 行情查询（最新 tick / K 线 / 基本信息）
+├── FastAPI app（HTTP :3301）
+│ ├── /quote — 行情查询（最新 tick / K 线 / 基本信息 / 板块 / 历史）
 │ └── /health — 健康检查
-├── MarketHub（xtdata 订阅管理，主线程初始化）
-│ ├── _on_tick() 回调（xtdata 内部线程）
-│ │ ├── HSET qmt:snapshot:tick （全量 tick 快照）
-│ │ ├── XADD qmt:stream:tick:{code} （个股 Stream）
-│ │ └── XADD qmt:stream:agg （聚合 Stream）
-│ └── _on_kline() 回调（xtdata 内部线程）
-│ └── XADD qmt:stream:kline:{period}:{code}
+├── MarketHub（xtdata 按需查询）
+│ ├── get_tick / get_ticks_batch — 实时查询最新 Tick
+│ ├── get_kline — K 线数据
+│ ├── get_instrument_detail — 股票基本信息
+│ ├── get_sector_list — 板块成分股
+│ └── download_history — 历史数据下载
 └── StatusReporter（独立线程，每10s）
-├── 采集：xtdata 连接状态 + Redis 连通性 + 订阅数量
+├── 采集：xtdata 连接状态 + Redis 连通性
 ├── SET qmt:market:status（TTL=35s）
 ├── PUBLISH qmt:status:notify（频道，Alpha 后端监听）
 └── 异常时企业微信告警（去重，仅首次触发）
@@ -309,79 +310,37 @@ qmt-trade/main.py
 
 | 进程                     | 线程                | 来源                         | 写入目标                                |
 |------------------------|-------------------|----------------------------|-------------------------------------|
-| qmt-market             | xtquant 内部线程      | xtdata Tick/Kline 回调       | Redis Stream + Hash（同步 RedisBridge） |
 | qmt-market             | StatusReporter 线程 | 定时器（10s）                   | `qmt:market:status` + Pub/Sub       |
 | qmt-trade              | xtquant 内部线程      | XtQuantTraderCallback 全部回调 | AccountHub 内存 + Redis               |
 | qmt-trade              | CmdConsumer 线程    | BRPOPLPUSH 阻塞等待            | xttrader 下单 + Redis 回报              |
 | qmt-trade              | AccountHub 轮询线程   | 定时器（10s）                   | AccountHub 内存 + Redis 快照            |
 | qmt-trade              | StatusReporter 线程 | 定时器（10s）                   | `qmt:trade:status` + Pub/Sub        |
-| qmt-trade / qmt-market | FastAPI 主线程       | HTTP 请求                    | 仅读内存 / Redis，不写 xtquant             |
+| qmt-trade / qmt-market | FastAPI 主线程       | HTTP 请求                    | 仅读内存 / xtdata，不写 Redis             |
 
 所有 AccountHub 写操作（`apply_*` + 轮询）通过 `threading.Lock` 保护内存一致性；
 Redis 写操作使用线程安全的同步 `redis.Redis` 连接。
 
 ### 3.3 行情模块（MarketHub）— 属于 qmt-market 进程
 
-职责：管理 xtdata 的行情订阅，将回调数据写入 Redis Stream 和快照 Hash。
+职责：封装 xtdata 同步查询接口，提供按需行情查询 API。
 进程隔离：本模块不 import 任何 xttrader / TradeHub / AccountHub 相关代码。
 
-#### 3.3.1 订阅池设计
+> **v1.3 架构变更**：行情订阅（全市场 Tick 推送 → Redis）已由旧实现接管（`qmt_tick.py`，独立进程），
+> 数据存储在 Redis db0（`qmt_tick:{YYYYMMDD}:{code}`，pickle 格式）。
+> MarketHub 不再订阅行情、不再有回调、不再写入 Redis Stream/Hash。
+> 本模块仅保留 xtdata 按需查询功能。
 
-订阅池持久化到 Redis Hash `qmt:sub:pool`，QMT-Server 重启后自动恢复：
-Key: qmt:sub:pool
-Type: Hash
-Field: stock_code （如 600519.SH）
-Value: JSON {"added_at": timestamp, "source": "alpha-backend"}
+#### 3.3.1 查询接口
 
-#### 3.3.2 Tick 回调处理流程
-
-# 伪代码，核心逻辑
-
-```python
-   def _on_tick(data: dict):
-    """xtquant 回调（在 xtdata 内部线程中执行）"""
-    for code, tick in data.items():
-        payload = _normalize_tick(code, tick)  # 标准化字段
-        # 使用 Pipeline 批量提交，4 次写操作合并为 1 次 RTT
-        pipe = redis.pipeline()
-        # 1. 写入快照 Hash（供直接查询）
-        pipe.hset("qmt:snapshot:tick", code, json.dumps(payload))
-        # 2. 写入个股 Stream（供精确消费）
-        pipe.xadd(
-            f"qmt:stream:tick:{code}",
-            payload,
-            maxlen=500,  # 每只股票保留最近 500 条 tick
-            approximate=True
-        )
-        # 3. 写入聚合 Stream（供 Alpha 后端统一消费）
-        pipe.xadd(
-            "qmt:stream:agg",
-            {"code": code, "data": json.dumps(payload)},
-            maxlen=50000,  # 全市场聚合保留 5 万条
-            approximate=True
-        )
-        # 4. 更新心跳时间戳（节流：仅距上次更新 > 1s 时写入，避免高频无意义写入）
-        now = time.time()
-        if now - self._last_heartbeat_ts > 1.0:
-            pipe.set("qmt:market:last_updated", str(now))
-            self._last_heartbeat_ts = now
-        pipe.execute()  # 一次性提交
-```
-
-#### 3.3.3 K 线订阅
-
-支持 `1m`、`5m`、`1d` 等周期，写入对应的 Redis Stream：
-Key: qmt:stream:kline:{period}:{code}
-MaxLen: 1000 （每只股票每周期）
-
-#### 3.3.4 订阅管理接口
-
-| 操作   | 说明                                                    |
-|------|-------------------------------------------------------|
-| 添加订阅 | 写入 Redis `qmt:sub:pool`，调用 `xtdata.subscribe_quote()` |
-| 取消订阅 | 从 `qmt:sub:pool` 删除，调用 `xtdata.unsubscribe_quote()`   |
-| 重启恢复 | 启动时读取 `qmt:sub:pool`，批量恢复订阅                           |
-| 上限控制 | 默认最多 500 只（可配置），超限拒绝并返回错误                             |
+| 方法                    | 说明                                     |
+|-----------------------|----------------------------------------|
+| get_tick(code)        | 通过 xtdata.get_full_tick 实时查询单只股票 Tick |
+| get_ticks_batch(codes) | 批量查询最新 Tick（最多 50 只）                |
+| get_kline(code, period, count) | 查询 K 线数据                        |
+| get_instrument_detail(code) | 查询股票基本信息（名称、涨停价等）             |
+| get_sector_list(sector) | 查询板块成分股列表                          |
+| get_full_tick(code)   | 查询完整 Tick（含逐笔）                    |
+| download_history(...) | 触发历史行情下载                           |
 
 ### 3.4 交易模块（TradeHub + CmdConsumer）— 属于 qmt-trade 进程
 
@@ -1217,18 +1176,18 @@ qmt-trade                `http://192.168.3.10:8090`                       交易
 | 1002 | 行情未连接（qmt-market）  |
 | 1003 | 交易未连接（qmt-trade）   |
 | 1004 | 账户未登录（qmt-trade）   |
-| 1005 | 超出订阅上限（qmt-market） |
+| 1005 | ~~已废弃（v1.3 移除订阅管理）~~ |
 | 2001 | 风控拒绝               |
 | 2002 | 委托失败               |
 | 5000 | 内部错误               |
 
-#### 3.7.2 行情服务接口表（qmt-market :8091）
+#### 3.7.2 行情服务接口表（qmt-market :3301）
 
 **健康检查**
 
 | 方法  | 路径        | 说明                                |
 |-----|-----------|-----------------------------------|
-| GET | `/health` | 行情服务健康状态（xtdata 连接 + Redis + 订阅数） |
+| GET | `/health` | 行情服务健康状态（xtdata 连接 + Redis 连通性） |
 
 **行情查询**
 
@@ -1241,15 +1200,6 @@ qmt-trade                `http://192.168.3.10:8090`                       交易
 | GET  | `/quote/sector/{sector}` | 查询板块成分股列表            |
 | GET  | `/quote/full_tick`       | 查询完整 Tick（含逐笔）       |
 | POST | `/quote/history`         | 查询历史行情（支持批量下载触发）     |
-
-**订阅管理**
-
-| 方法     | 路径                  | 说明       |
-|--------|---------------------|----------|
-| GET    | `/subscribe/list`   | 当前订阅列表   |
-| POST   | `/subscribe/add`    | 添加订阅（批量） |
-| POST   | `/subscribe/remove` | 取消订阅（批量） |
-| DELETE | `/subscribe/all`    | 清空全部订阅   |
 
 **控制**
 
@@ -1295,36 +1245,13 @@ qmt-trade                `http://192.168.3.10:8090`                       交易
 | POST | `/control/reconnect` | 重连 xttrader |
 | GET  | `/control/config`    | 查看当前配置（脱敏）  |
 
-### 3.8 WebSocket 推送层
-
-行情 WebSocket 由 qmt-market 进程（:8091）提供，供调试工具直接订阅行情（不经
-Alpha 后端中转）：
-ws://192.168.3.10:8091/ws/quote
-
-协议：客户端发送订阅消息，服务端推送 Tick 事件：
-
-      //   客户端 → 服务端：订阅
-      {"action": "subscribe", "codes": ["600519.SH", "000001.SZ"]}
-
-// 服务端 → 客户端：Tick 推送
-{"type": "tick", "code": "600519.SH", "data": {...}, "ts": 1713000000}
-
-// 服务端 → 客户端：心跳
-{"type": "ping", "ts": 1713000000}
-
-### 3.9 Redis 桥接层（RedisBridge）
+### 3.8 Redis 桥接层（RedisBridge）
 
 统一封装所有 Redis 写操作，解耦 xtquant 与 Redis 的直接依赖：
 
 ```python
   class RedisBridge:
     """   所有对 Redis 的写操作集中于此，便于测试 mock 和监控"""
-
-    def publish_tick(self, code: str, payload: dict) -> None:
-        """   写入 Tick 数据（快照 + Stream）"""
-
-    def publish_kline(self, code: str, period: str, payload: dict) -> Non
-        """   写入 K 线数据"""
 
     def publish_order_event(self, event: dict) -> None:
         """   写入订单回报事件"""
@@ -1340,9 +1267,6 @@ ws://192.168.3.10:8091/ws/quote
 
     def nack_cmd(self, cmd: dict, reason: str) -> None:
         """   命令处理失败，重入队列或转死信"""
-
-    def heartbeat(self) -> None:
-        """   更新 QMT-Server 心跳时间戳（已由 publish_status 取代，保留兼容）"""
 
     def publish_status(self, status: dict, service: str) -> None:
         """
@@ -1362,7 +1286,7 @@ ws://192.168.3.10:8091/ws/quote
     """   更新单个子系统状态（on_disconnected 等紧急场景直接调用）"""
 ```
 
-### 3.9.1 优雅关机（Graceful Shutdown）
+### 3.8.1 优雅关机（Graceful Shutdown）
 
 两个服务均需实现优雅关机流程，确保数据不丢失、状态不残留：
 
@@ -1747,15 +1671,17 @@ payload 含 source 字
 最近 200 条） StatusReporter
 `qmt:account:online:       String 账户在线状态                60s         on_account_status
 {account_id}`                      （"online"/"offline"） 回调
-`qmt:sub:pool`             Hash 当前行情订阅池 永久 MarketHub
-`qmt:snapshot:tick`        Hash 最新 Tick 全量快照 永久 MarketHub
-（field=code）
-`qmt:snapshot:kline:       Hash 最新 K 线快照                永久          MarketHub
-{period}`                          （field=code）
-`qmt:stream:agg`           Stream 全量行情聚合 Stream maxlen=50000 MarketHub
-`qmt:stream:tick:{code}`   Stream 单股 Tick Stream maxlen=500 MarketHub
-`qmt:stream:kline:         Stream 单股 K 线 Stream         maxlen=1000 MarketHub
+`qmt:sub:pool`             Hash ~~已废弃（v1.3 移除订阅管理）~~
+`qmt:snapshot:tick`        Hash ~~已废弃（v1.3 行情由旧实现接管）~~
+`qmt:snapshot:kline:       Hash ~~已废弃（v1.3 行情由旧实现接管）~~
+{period}`
+`qmt:stream:agg`           Stream ~~已废弃（v1.3 行情由旧实现接管）~~
+`qmt:stream:tick:{code}`   Stream ~~已废弃（v1.3 行情由旧实现接管）~~
+`qmt:stream:kline:         Stream ~~已废弃（v1.3 行情由旧实现接管）~~
 {period}:{code}`
+`qmt_tick:{YYYYMMDD}       List 旧实现 Tick 数据（pickle） 当日 qmt_tick.py
+:{code}`                          （LRANGE -1 -1 读取最新）
+`qmt:market:last_updated`  String ~~已废弃（v1.3 心跳由 StatusReporter 管理）~~
 
 `qmt:account:asset`        String 资金快照 JSON 60s on_stock_trade 回
 调 / full_sync
@@ -1779,7 +1705,7 @@ BRPOPLPUSH 读）
 `qmt:market:last_updated` String 最后行情更新时间戳 永久 MarketHub
 `qmt:kill_switch`         String 熔断开关（"1"=激活） 永久 Alpha 后端写入，
 TradeHub 读取
-`qmt:config:sub_limit`    String 最大订阅数（热更新） 永久 管理员
+`qmt:config:sub_limit`    String ~~已废弃（v1.3 移除订阅管理）~~
 
 ### 4.2 行情数据格式
 
@@ -1997,25 +1923,11 @@ class QmtService:
         ...
 ```
 
-#### 5.1.2 `backend/worker/qmt_market_worker.py`
+#### 5.1.2 `backend/worker/qmt_market_worker.py`（已移除）
 
-职责：后台消费 `qmt:stream:agg`，将 QMT 行情同步到系统内部 Redis 格式，并通过 WebSocket 广播前端。
-
-> **Tick 格式映射**：QMT-Server 写入 `qmt:stream:agg` 的字段名遵循 Section 4.2 的 `TickData` schema（如 `last_price`、`bid_price1` 等）。Alpha 后端 `QmtMarketWorker` 消费后直接透传，不做字段重命名——因为 A 股交易页面使用独立的 `QmtOrderPanel` 等组件，不复用 IBKR 行情组件。如果未来需要统一展示，再增加格式转换层。
-
-```python
-class QmtMarketWorker:
-    """消费 QMT 聚合 Stream，直接透传并广播（A 股使用独立前端组件，无需格式转换）"""
-
-    async def start(self):
-        """持续消费 qmt:stream:agg（XREAD block=100ms）"""
-
-    async def _process_tick(self, code: str, tick: dict):
-        """将 Tick 数据写入 Alpha 内部缓存 Redis market:data:latest:{code}"""
-
-    async def _broadcast_ws(self, tick: dict):
-        """推送到 WebSocket 前端（通过现有 QuoteStreamService）"""
-```
+> **v1.3 变更**：行情订阅已由旧实现（`qmt_tick.py`）接管，Tick 数据存储在 Redis db0（pickle 格式）。
+> Alpha 后端通过 `QmtService.get_snapshot` / `get_tick` 直接从 Redis 读取，
+> 不再需要独立的 Worker 消费 `qmt:stream:agg`。此文件已删除。
 
 #### 5.1.3 `backend/worker/qmt_order_worker.py`
 
@@ -2251,15 +2163,6 @@ prefix="/qmt", tags=["QMT"])`
 | GET | `/api/v1/qmt/quote/detail/{code}`   | 股票基础信息      |
 | GET | `/api/v1/qmt/quote/sector/{sector}` | 板块股票列表      |
 
-**订阅管理**
-
-| 方法     | 路径                             | 说明     |
-|--------|--------------------------------|--------|
-| GET    | `/api/v1/qmt/subscribe`        | 当前订阅列表 |
-| POST   | `/api/v1/qmt/subscribe/add`    | 添加订阅   |
-| POST   | `/api/v1/qmt/subscribe/remove` | 取消订阅   |
-| DELETE | `/api/v1/qmt/subscribe`        | 清空订阅   |
-
 **账户接口**
 
 | 方法  | 路径                              | 说明   |
@@ -2408,7 +2311,7 @@ QmtPositionList（持仓列表）：
 `   可用 = 0` 且 `持仓 > 0`：今日买入，T+1 限制，显示"T+1"徽章而非"卖出"按钮
 点击"卖出"按钮：自动预填下单面板（方向=卖出，代码=该股，数量=可用数量，价格=
 现价）
-现价来自 Redis `qmt:snapshot:tick`（实时刷新，若无行情则显示"--"）
+现价来自 Redis db0 `qmt_tick:{YYYYMMDD}:{code}`（旧实现实时推送，若无行情则显示"--"）
 QmtOrderList（当日委托）：
 时间 代码 名称 方向 数量 价格 成交量 成交均价 状态 操作
 09:30:00 600519.SH 贵州茅台 买入 100股 1855.00 100股 1854.50 全部成交 -
@@ -2544,7 +2447,7 @@ QMT 接口调试台
 │ │ qmt:market:status / qmt:trade:status / qmt:account:asset /
 │ │ qmt:account:positions / qmt:cmd:queue
 │ ├── QMT Stream预览
-│ │ ├── 选择 Stream（qmt:stream:agg / qmt:event:order_update）
+│ │ ├── 选择 Stream（qmt:event:order_update）
 │ │ ├── [开始/停止] 自动刷新（2s）
 │ │ └── 最新 10 条记录（时间 + JSON 折叠）
 │ └── 请求历史（最近 30 次）
@@ -2766,11 +2669,6 @@ A 股交易时间为北京时间（Asia/Shanghai），无夏令时，所有时�
 "health_check_interval": 30
 },
 "market": {
-"max_subscribe_count": 500,
-"tick_stream_maxlen": 500,
-"agg_stream_maxlen": 50000,
-"kline_stream_maxlen": 1000,
-"heartbeat_interval": 10
 },
 "trade": {
 "cmd_queue_timeout": 5,
