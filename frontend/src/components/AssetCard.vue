@@ -25,14 +25,10 @@
 <script setup lang="ts">
 import { storeToRefs } from 'pinia'
 import { useAccountStore } from '@/stores/account'
+import { formatMoney } from '@/utils/format'
 
 const account = useAccountStore()
 const { asset } = storeToRefs(account)
-
-function formatMoney(val: number | undefined): string {
-  if (val == null) return '--'
-  return val.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-}
 </script>
 
 <style scoped>

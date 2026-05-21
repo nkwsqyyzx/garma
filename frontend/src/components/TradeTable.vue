@@ -6,7 +6,9 @@
 
     <!-- PC: 表格 -->
     <el-table v-if="!isMobile" :data="trades" stripe style="width: 100%">
-      <el-table-column prop="traded_time" label="时间" width="100" />
+      <el-table-column label="时间" width="130">
+        <template #default="{ row }">{{ formatTime(row.traded_time) }}</template>
+      </el-table-column>
       <el-table-column prop="stock_code" label="代码" width="110" />
       <el-table-column label="名称" width="90">
         <template #default="{ row }">{{ account.getStockName(row.stock_code) }}</template>
@@ -38,7 +40,7 @@
             <span class="card-name">{{ account.getStockName(trade.stock_code) }}</span>
           </div>
           <div class="card-right">
-            <span class="card-time">{{ trade.traded_time }}</span>
+            <span class="card-time">{{ formatTime(trade.traded_time) }}</span>
           </div>
         </div>
         <div class="card-info">
@@ -57,16 +59,12 @@ import { storeToRefs } from 'pinia'
 import { useAccountStore } from '@/stores/account'
 import { useBreakpoint } from '@/composables/useBreakpoint'
 import { getStockNames } from '@/api/qmt'
+import { formatMoney, formatTime } from '@/utils/format'
 import { onMounted } from 'vue'
 
 const account = useAccountStore()
 const { trades } = storeToRefs(account)
 const { isMobile } = useBreakpoint()
-
-function formatMoney(val: number | undefined): string {
-  if (val == null) return '--'
-  return val.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-}
 
 onMounted(async () => {
   if (trades.value.length) {

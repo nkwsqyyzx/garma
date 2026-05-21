@@ -5,18 +5,18 @@
       <!-- 卖盘 (5→1) -->
       <div class="book-row ask" v-for="i in 5" :key="'a'+i">
         <span class="level-label">卖{{ 6 - i }}</span>
-        <span class="price">{{ formatPrice(tick[`ask${6-i}`]) }}</span>
+        <span class="price">{{ fmtPrice(tick[`ask${6-i}`]) }}</span>
         <span class="vol">{{ formatVol(tick[`ask_vol${6-i}`]) }}</span>
       </div>
       <!-- 最新价 -->
       <div class="last-price" :class="pnlClass(tick.pct_change)">
-        {{ formatPrice(tick.last) }}
+        {{ fmtPrice(tick.last) }}
         <span class="pct">{{ formatPct(tick.pct_change) }}</span>
       </div>
       <!-- 买盘 (1→5) -->
       <div class="book-row bid" v-for="i in 5" :key="'b'+i">
         <span class="level-label">买{{ i }}</span>
-        <span class="price">{{ formatPrice(tick[`bid${i}`]) }}</span>
+        <span class="price">{{ fmtPrice(tick[`bid${i}`]) }}</span>
         <span class="vol">{{ formatVol(tick[`bid_vol${i}`]) }}</span>
       </div>
     </div>
@@ -27,11 +27,16 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import { getTick } from '@/api/qmt'
+import { formatPrice, formatPct, pnlClass } from '@/utils/format'
 
 const props = defineProps<{ code: string }>()
 
 const tick = ref<any>(null)
 let timer: ReturnType<typeof setInterval> | null = null
+
+function fmtPrice(val: number | undefined) {
+  return formatPrice(props.code, val)
+}
 
 async function loadTick() {
   try {
@@ -41,32 +46,10 @@ async function loadTick() {
   }
 }
 
-function isETF(code: string): boolean {
-  const p = code.replace(/\.(SH|SZ)/, '')
-  return /^(51|15|16|50|52|56|58|59)/.test(p)
-}
-
-function formatPrice(val: number | undefined): string {
-  if (val == null || val === 0) return '--'
-  const digits = isETF(props.code) ? 3 : 2
-  return val.toFixed(digits)
-}
-
 function formatVol(val: number | undefined): string {
   if (val == null) return '--'
   if (val >= 10000) return (val / 10000).toFixed(1) + '万'
   return val.toString()
-}
-
-function formatPct(val: number | undefined): string {
-  if (val == null) return ''
-  const prefix = val > 0 ? '+' : ''
-  return `${prefix}${val.toFixed(2)}%`
-}
-
-function pnlClass(val: number | undefined): string {
-  if (val == null) return ''
-  return val > 0 ? 'pnl-up' : val < 0 ? 'pnl-down' : ''
 }
 
 onMounted(() => {

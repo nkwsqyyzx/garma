@@ -65,6 +65,7 @@
 import { reactive, ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { getStockNames, getSnapshot, placeOrder } from '@/api/qmt'
+import { isETF } from '@/utils/format'
 import { useAccountStore } from '@/stores/account'
 import { storeToRefs } from 'pinia'
 
@@ -92,11 +93,6 @@ const currentPrice = ref(0)
 const limitUp = ref(0)
 const limitDown = ref(0)
 const submitting = ref(false)
-
-function isETF(code: string): boolean {
-  const p = code.replace(/\.(SH|SZ)/, '')
-  return /^(51|15|16|50|52|56|58|59)/.test(p)
-}
 
 const pricePrecision = computed(() => isETF(form.stock_code) ? 3 : 2)
 const priceStep = computed(() => isETF(form.stock_code) ? 0.001 : 0.01)

@@ -7,7 +7,9 @@
 
     <!-- PC: 表格 -->
     <el-table v-if="!isMobile" :data="orders" stripe style="width: 100%">
-      <el-table-column prop="order_time" label="时间" width="100" />
+      <el-table-column label="时间" width="130">
+        <template #default="{ row }">{{ formatTime(row.order_time) }}</template>
+      </el-table-column>
       <el-table-column prop="stock_code" label="代码" width="110" />
       <el-table-column prop="stock_name" label="名称" width="90" />
       <el-table-column label="方向" width="60" align="center">
@@ -55,7 +57,7 @@
           </div>
         </div>
         <div class="card-info">
-          <span>{{ order.order_time }}</span>
+          <span>{{ formatTime(order.order_time) }}</span>
           <span>{{ order.price?.toFixed(2) }} x {{ order.order_volume }}</span>
           <span>成交 {{ order.traded_volume }}</span>
           <el-button v-if="isCancelable(resolveStatus(order))" type="warning" size="small" text @click="onCancel(order)">撤单</el-button>
@@ -73,6 +75,7 @@ import { storeToRefs } from 'pinia'
 import { useAccountStore } from '@/stores/account'
 import { useBreakpoint } from '@/composables/useBreakpoint'
 import { cancelOrder, cancelAll } from '@/api/qmt'
+import { formatTime } from '@/utils/format'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 const account = useAccountStore()
