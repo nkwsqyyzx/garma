@@ -6,6 +6,7 @@ from fastapi import APIRouter
 
 from .health import router as health_router
 from .quote import router as quote_router
+from .rpc import router as rpc_router
 
 
 def create_router() -> APIRouter:
@@ -13,4 +14,5 @@ def create_router() -> APIRouter:
     root = APIRouter()
     root.include_router(quote_router)
     root.include_router(health_router)
+    root.include_router(rpc_router)
     return root
