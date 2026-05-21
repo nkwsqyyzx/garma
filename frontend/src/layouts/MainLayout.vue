@@ -23,6 +23,9 @@
         <el-menu-item index="/trade">
           <span>下单</span>
         </el-menu-item>
+        <el-menu-item index="/strategies">
+          <span>策略持仓</span>
+        </el-menu-item>
       </el-menu>
     </el-aside>
 

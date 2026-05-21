@@ -12,6 +12,7 @@ const router = createRouter({
         { path: 'orders', name: 'orders', component: () => import('@/views/Orders.vue') },
         { path: 'trades', name: 'trades', component: () => import('@/views/Trades.vue') },
         { path: 'trade', name: 'trade', component: () => import('@/views/Trade.vue') },
+        { path: 'strategies', name: 'strategies', component: () => import('@/views/StrategyPositions.vue') },
       ],
     },
   ],

@@ -89,3 +89,21 @@ export async function cancelAll() {
     method: 'POST',
   })
 }
+
+// ── 策略持仓 ─────────────────────────────────────────
+
+export interface StrategyPosition {
+  stock_code: string
+  volume: number
+  trade_date: string
+  avg_price: number
+  other: string
+  cost: number
+  pct_change: number
+  current_price: number
+  pnl: number
+}
+
+export async function getStrategyPositions() {
+  return request<StrategyPosition[]>('/strategy/positions')
+}
