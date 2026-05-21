@@ -568,6 +568,56 @@ class QmtService:
             return None
 
     # ------------------------------------------------------------------
+    # 策略持仓
+    # ------------------------------------------------------------------
+
+    async def get_strategy_positions(self) -> list[dict]:
+        """从 qmt-market RPC 读取当天成交缓存中的 hold 列表，补充实时行情。"""
+        if not self._market_http:
+            return []
+        today = date.today().strftime("%Y%m%d")
+        key = f"{today}_成交缓存信息"
+        try:
+            resp = await self._market_http.get(f"/rpc/kv/{key}")
+            data = resp.json().get("data")
+            if not data or "hold" not in data:
+                return []
+        except httpx.HTTPError:
+            return []
+
+        hold_list = data["hold"]
+        if not hold_list:
+            return []
+
+        # 收集所有证券代码，批量获取最新价
+        codes = list({item["证券代码"] for item in hold_list})
+        snapshot = await self.get_snapshot(codes)
+
+        results = []
+        for item in hold_list:
+            code = item["证券代码"]
+            volume = item.get("持仓量", 0)
+            avg_price = item.get("成交均价", 0)
+            cost = volume * avg_price
+            tick = snapshot.get(code, {})
+            current_price = tick.get("last", avg_price)
+            pct_change = tick.get("pct_change", 0)
+            pnl = (current_price - avg_price) * volume if avg_price else 0
+
+            results.append({
+                "stock_code": code,
+                "volume": volume,
+                "trade_date": item.get("交易日期", "")[:10],
+                "avg_price": avg_price,
+                "other": item.get("其他", ""),
+                "cost": cost,
+                "pct_change": pct_change,
+                "current_price": current_price,
+                "pnl": pnl,
+            })
+        return results
+
+    # ------------------------------------------------------------------
     # 关闭
     # ------------------------------------------------------------------
 
