@@ -5,7 +5,7 @@
       <span class="status-text">{{ connected ? '已连接' : '未连接' }}</span>
       <span class="status-divider">|</span>
       <span class="status-dot" :class="marketDotClass"></span>
-      <span class="status-text" :class="{ 'delay-warn': marketDelay > 10 }">{{ marketLabel }}</span>
+      <span class="status-text" :class="{ 'delay-warn': (marketDelay ?? 0) > 10 }">{{ marketLabel }}</span>
     </div>
   </div>
 </template>
