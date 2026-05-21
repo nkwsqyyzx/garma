@@ -50,6 +50,7 @@ class QmtServiceStatus(BaseModel):
     status: str = Field(default="unknown")
     level: str = Field(default="offline")
     last_heartbeat: datetime | None = Field(default=None)
+    tick_delay: float | None = Field(default=None, description="行情延迟秒数")
 
 
 class QmtHealthResponse(BaseModel):

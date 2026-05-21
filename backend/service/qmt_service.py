@@ -118,7 +118,94 @@ class QmtService:
             return None
 
     async def get_kline(self, code: str, period: str, count: int) -> list[dict]:
-        """获取 K 线数据，代理到 qmt-market 服务。"""
+        """获取 K 线数据，Redis 缓存 + 代理到 qmt-market 服务，日K追加当日 tick。"""
+        cache_key = f"qmt:kline:{code}:{period}:{count}"
+
+        # 1) 尝试从 Redis 缓存读取
+        import asyncio as _aio
+        cached = await _aio.to_thread(self._redis.get, cache_key)
+        result = None
+        if cached:
+            try:
+                result = json.loads(cached)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # 2) 缓存未命中，请求 qmt-market
+        if not result:
+            result = await self._fetch_kline(code, period, count)
+            if not result:
+                result = []
+            # 写入缓存，过期时间到次日 09:15
+            if result:
+                ttl = self._seconds_until_next_0915()
+                await _aio.to_thread(
+                    self._redis.setex, cache_key, ttl,
+                    json.dumps(result, ensure_ascii=False, default=str),
+                )
+                logger.debug("Kline cached: key={} ttl={}s", cache_key, ttl)
+
+        # 3) 日K线：追加当日 tick 数据作为最新一根 K 线
+        if period == "1d":
+            today_bar = await self._today_tick_to_kline(code)
+            if today_bar:
+                today_str = date.today().strftime("%Y-%m-%d")
+                today_compact = date.today().strftime("%Y%m%d")
+                _appended = False
+                if result:
+                    last_date = (
+                        result[-1].get("time")
+                        or result[-1].get("date")
+                        or result[-1].get("datetime")
+                        or ""
+                    )
+                    if last_date in (today_str, today_compact) or last_date.startswith(today_str):
+                        result[-1] = today_bar
+                        _appended = True
+                if not _appended:
+                    result.append(today_bar)
+
+        return result
+
+    async def _today_tick_to_kline(self, code: str) -> dict | None:
+        """从 Redis tick 数据构造今日 K 线 bar（取最新一条 tick，其 OHLCV 已是日累计值）。"""
+        import asyncio as _aio
+        today = date.today().strftime("%Y%m%d")
+        try:
+            raw_list = await _aio.to_thread(
+                self._tick_redis.lrange, f"qmt_tick:{today}:{code}", -1, -1
+            )
+            if not raw_list:
+                return None
+            row = pickle.loads(raw_list[0])
+            # row = [time, lastPrice, open, high, low, lastClose, amount, volume, ...]
+            if len(row) < 8:
+                return None
+            return {
+                "time": date.today().strftime("%Y-%m-%d"),
+                "open": row[2],
+                "close": row[1],
+                "high": row[3],
+                "low": row[4],
+                "volume": row[7],
+                "amount": row[6],
+            }
+        except Exception as e:
+            logger.debug("Failed to build today kline from tick for {}: {}", code, e)
+            return None
+
+    def _seconds_until_next_0915(self) -> int:
+        """计算到下一个交易日 09:15 的秒数。"""
+        from datetime import datetime, time, timedelta
+        now = datetime.now()
+        target = datetime.combine(now.date(), time(9, 15))
+        if now >= target:
+            target = datetime.combine(now.date() + timedelta(days=1), time(9, 15))
+        delta = int((target - now).total_seconds())
+        return max(delta, 60)  # 至少 60 秒
+
+    async def _fetch_kline(self, code: str, period: str, count: int) -> list[dict]:
+        """实际请求 qmt-market 获取 K 线。"""
         if not self._market_http:
             return []
         try:
@@ -367,6 +454,7 @@ class QmtService:
                     status=overall,
                     level="offline" if overall == "offline" else overall,
                     last_heartbeat=d.get("server_time"),
+                    tick_delay=d.get("tick_delay_seconds"),
                 )
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass

@@ -32,6 +32,16 @@ export async function getStockNames(codes: string[]) {
   return request<Record<string, string>>(`/quote/stock_names?codes=${codes.join(',')}`)
 }
 
+// ── 状态 ──────────────────────────────────────────────
+
+export async function getHealth() {
+  return request<{
+    market: { status: string; level: string; tick_delay: number | null } | null
+    trade: { status: string; level: string } | null
+    online: boolean
+  }>('/health')
+}
+
 // ── 账户 ──────────────────────────────────────────────
 
 export async function getAsset() {
