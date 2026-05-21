@@ -65,14 +65,14 @@ class QmtOrderWorker:
                 continue
 
             try:
-                # XREADGROUP 阻塞 5000ms
+                # XREADGROUP 阻塞 2000ms（低于 socket_timeout=3s，避免超时）
                 results = await asyncio.to_thread(
                     self._redis.xreadgroup,
                     groupname=GROUP_NAME,
                     consumername=CONSUMER_NAME,
                     streams={KEY_EVENT_ORDER_UPDATE: ">"},
                     count=10,
-                    block=5000,
+                    block=2000,
                 )
                 if not results:
                     continue
@@ -83,6 +83,9 @@ class QmtOrderWorker:
 
             except asyncio.CancelledError:
                 break
+            except (redis.TimeoutError, TimeoutError):
+                # socket_timeout 超时，正常行为，不打堆栈
+                continue
             except redis.ConnectionError:
                 logger.error("Redis connection lost, reconnecting in 3s...")
                 await asyncio.sleep(3)

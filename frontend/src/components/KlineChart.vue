@@ -12,6 +12,7 @@
       </div>
     </template>
     <div ref="chartRef" class="chart-container"></div>
+    <div v-if="noData" class="empty-text">暂无K线数据</div>
   </el-card>
 </template>
 
@@ -23,6 +24,7 @@ const props = defineProps<{ code: string }>()
 
 const chartRef = ref<HTMLDivElement>()
 const period = ref('1d')
+const noData = ref(false)
 let chart: any = null
 let resizeObserver: ResizeObserver | null = null
 
@@ -30,6 +32,7 @@ async function loadData() {
   if (!props.code) return
   try {
     const data = await getKline(props.code, period.value, 120)
+    noData.value = !data?.length
     renderChart(data)
   } catch {
     // ignore
@@ -39,7 +42,7 @@ async function loadData() {
 function renderChart(data: any[]) {
   if (!chart || !data?.length) return
 
-  const dates = data.map(d => d.time || d.date || '')
+  const dates = data.map(d => d.time || d.date || d.datetime || '')
   const ohlc = data.map(d => [d.open, d.close, d.low, d.high])
   const volumes = data.map(d => d.volume || 0)
   const isUp = data.map(d => d.close >= d.open)
@@ -93,7 +96,7 @@ function renderChart(data: any[]) {
 
 onMounted(() => {
   if (chartRef.value) {
-    chart = echarts.init(chartRef.value)
+    chart = (window as any).echarts.init(chartRef.value)
     resizeObserver = new ResizeObserver(() => chart?.resize())
     resizeObserver.observe(chartRef.value)
   }
@@ -118,6 +121,7 @@ watch(() => props.code, () => loadData())
   width: 100%;
   height: 400px;
 }
+.empty-text { text-align: center; color: #c0c4cc; padding: 32px 0; }
 @media (max-width: 768px) {
   .chart-container { height: 300px; }
 }

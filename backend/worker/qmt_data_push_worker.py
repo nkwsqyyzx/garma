@@ -33,6 +33,7 @@ class QmtDataPushWorker:
         self._subscriptions: dict[int, set[str]] = {}  # queue_id -> subscribed types
         self._running = False
         self._tasks: list[asyncio.Task] = []
+        self._last_values: dict[str, str] = {}  # 共享的 last_values，初始快照也写入
 
     def start(self) -> list[asyncio.Task]:
         self._running = True
@@ -58,28 +59,28 @@ class QmtDataPushWorker:
         self._subscriptions[id(queue)] = types
 
     async def send_initial_snapshot(self, queue: asyncio.Queue, subscriptions: set[str] | None = None):
-        """连接建立后推送一次全量快照。"""
+        """连接建立后推送一次全量快照，同时更新 last_values 避免重复推送。"""
         subs = subscriptions or {"asset", "positions", "orders", "trades"}
         try:
-            if "asset" in subs:
-                data = await self._svc.get_asset()
-                await queue.put({"type": "asset", "data": data})
-            if "positions" in subs:
-                data = await self._svc.get_positions()
-                await queue.put({"type": "positions", "data": data})
-            if "orders" in subs:
-                data = await self._svc.get_orders()
-                await queue.put({"type": "orders", "data": data})
-            if "trades" in subs:
-                data = await self._svc.get_trades()
-                await queue.put({"type": "trades", "data": data})
+            fetchers = {
+                "asset": self._svc.get_asset,
+                "positions": self._svc.get_positions,
+                "orders": self._svc.get_orders,
+                "trades": self._svc.get_trades,
+            }
+            for msg_type, fetcher in fetchers.items():
+                if msg_type not in subs:
+                    continue
+                data = await fetcher()
+                # 将当前值记入 last_values，避免 poll_loop 首轮重复推送
+                raw_str = json.dumps(data, default=str) if data is not None else ""
+                self._last_values[msg_type] = raw_str
+                await queue.put({"type": msg_type, "data": data})
         except Exception:
             logger.exception("Failed to send initial snapshot")
 
     async def _poll_loop(self) -> None:
         """每 2 秒轮询 Redis key，检测变化后推送。仅交易时间运行。"""
-        last_values: dict[str, str] = {}
-
         while self._running:
             if not is_trading_hours():
                 wait = seconds_until_trading_start()
@@ -92,8 +93,8 @@ class QmtDataPushWorker:
                     raw = await asyncio.to_thread(self._redis.get, key)
                     raw_str = raw if isinstance(raw, str) else (raw.decode() if raw else "")
 
-                    if raw_str != last_values.get(key):
-                        last_values[key] = raw_str
+                    if raw_str != self._last_values.get(msg_type):
+                        self._last_values[msg_type] = raw_str
                         if raw_str:
                             try:
                                 data = json.loads(raw_str)

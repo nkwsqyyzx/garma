@@ -273,7 +273,7 @@ if __name__ == "__main__":
     settings = get_settings()
     uvicorn.run(
         "backend.main:app",
-        host="192.168.1.11",
+        host="0.0.0.0",
         port=settings.BACKEND_PORT,
         reload=False,
         log_level="info",

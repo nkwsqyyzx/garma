@@ -68,6 +68,8 @@ class QmtStatusWorker:
             except redis.ConnectionError:
                 logger.error("Redis Pub/Sub connection lost, reconnecting in 5s...")
                 await asyncio.sleep(5)
+            except (redis.TimeoutError, TimeoutError):
+                continue
             except Exception:
                 logger.exception("PubSub loop error")
                 await asyncio.sleep(3)

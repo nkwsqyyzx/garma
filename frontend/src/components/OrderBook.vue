@@ -41,9 +41,15 @@ async function loadTick() {
   }
 }
 
+function isETF(code: string): boolean {
+  const p = code.replace(/\.(SH|SZ)/, '')
+  return /^(51|15|16|50|52|56|58|59)/.test(p)
+}
+
 function formatPrice(val: number | undefined): string {
   if (val == null || val === 0) return '--'
-  return val.toFixed(2)
+  const digits = isETF(props.code) ? 3 : 2
+  return val.toFixed(digits)
 }
 
 function formatVol(val: number | undefined): string {

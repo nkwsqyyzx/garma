@@ -24,13 +24,13 @@
       <el-table-column prop="traded_volume" label="已成交" width="90" align="right" />
       <el-table-column label="状态" width="100" align="center">
         <template #default="{ row }">
-          <el-tag :type="statusType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
+          <el-tag :type="statusType(resolveStatus(row))" size="small">{{ statusLabel(resolveStatus(row)) }}</el-tag>
         </template>
       </el-table-column>
       <el-table-column label="操作" width="80" align="center">
         <template #default="{ row }">
           <el-button
-            v-if="isCancelable(row.status)"
+            v-if="isCancelable(resolveStatus(row))"
             type="warning"
             size="small"
             text
@@ -51,14 +51,14 @@
             <span class="card-name">{{ order.stock_name || order.stock_code }}</span>
           </div>
           <div class="card-right">
-            <el-tag :type="statusType(order.status)" size="small">{{ statusLabel(order.status) }}</el-tag>
+            <el-tag :type="statusType(resolveStatus(order))" size="small">{{ statusLabel(resolveStatus(order)) }}</el-tag>
           </div>
         </div>
         <div class="card-info">
           <span>{{ order.order_time }}</span>
           <span>{{ order.price?.toFixed(2) }} x {{ order.order_volume }}</span>
           <span>成交 {{ order.traded_volume }}</span>
-          <el-button v-if="isCancelable(order.status)" type="warning" size="small" text @click="onCancel(order)">撤单</el-button>
+          <el-button v-if="isCancelable(resolveStatus(order))" type="warning" size="small" text @click="onCancel(order)">撤单</el-button>
         </div>
       </el-card>
     </div>
@@ -81,7 +81,27 @@ const { isMobile } = useBreakpoint()
 
 const CANCELABLE = new Set(['submitted', 'reported', 'partial', 'PENDING', 'SUBMITTED', 'PARTIALLY_FILLED'])
 
-const hasCancelable = computed(() => orders.value.some(o => isCancelable(o.status)))
+const hasCancelable = computed(() => orders.value.some(o => isCancelable(resolveStatus(o))))
+
+function resolveStatus(order: any): string {
+  const s = order.status || ''
+  const vol = order.order_volume || 0
+  const traded = order.traded_volume || 0
+  // 完全成交 → filled（不管原始状态是什么）
+  if (vol > 0 && traded >= vol) return 'filled'
+  // 部分成交
+  if (traded > 0 && traded < vol) return 'partial'
+  // QMT 原始状态映射
+  const map: Record<string, string> = {
+    CANCELING: 'cancelled',
+    CANCELLED: 'cancelled',
+    UNKNOWN: 'submitted',
+    PENDING: 'submitted',
+    FILED: 'filled',
+    REJECTED: 'rejected',
+  }
+  return map[s] || s
+}
 
 function isCancelable(status: string): boolean {
   return CANCELABLE.has(status)

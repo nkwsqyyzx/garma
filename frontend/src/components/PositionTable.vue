@@ -6,27 +6,27 @@
     </div>
 
     <!-- PC: 表格 -->
-    <el-table v-if="!isMobile" :data="positions" stripe @row-click="onRowClick" style="width: 100%" highlight-current-row>
-      <el-table-column prop="stock_code" label="代码" width="110" />
-      <el-table-column label="名称" width="100">
+    <el-table v-if="!isMobile" :data="positions" stripe @row-click="onRowClick" style="width: 100%" highlight-current-row :default-sort="{ prop: 'market_value', order: 'descending' }">
+      <el-table-column prop="stock_code" label="代码" width="110" sortable />
+      <el-table-column label="名称" width="100" sortable :sort-method="sortByStockName">
         <template #default="{ row }">{{ account.getStockName(row.stock_code) }}</template>
       </el-table-column>
-      <el-table-column prop="volume" label="持仓" width="90" align="right" />
-      <el-table-column prop="can_use_volume" label="可卖" width="90" align="right" />
-      <el-table-column label="市值" width="120" align="right">
+      <el-table-column prop="volume" label="持仓" width="90" align="right" sortable />
+      <el-table-column prop="can_use_volume" label="可卖" width="90" align="right" sortable />
+      <el-table-column prop="market_value" label="市值" width="120" align="right" sortable>
         <template #default="{ row }">{{ formatMoney(row.market_value) }}</template>
       </el-table-column>
-      <el-table-column label="盈亏" width="120" align="right">
+      <el-table-column prop="profit_loss" label="盈亏" width="120" align="right" sortable>
         <template #default="{ row }">
           <span :class="pnlClass(row.profit_loss)">{{ formatMoney(row.profit_loss) }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="盈亏%" width="100" align="right">
+      <el-table-column prop="profit_loss_ratio" label="盈亏%" width="100" align="right" sortable>
         <template #default="{ row }">
           <span :class="pnlClass(row.profit_loss)">{{ formatPct(row.profit_loss_ratio) }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="成本价" width="90" align="right">
+      <el-table-column prop="open_price" label="成本价" width="90" align="right" sortable>
         <template #default="{ row }">{{ row.open_price?.toFixed(2) }}</template>
       </el-table-column>
     </el-table>
@@ -65,7 +65,7 @@ import { useAccountStore } from '@/stores/account'
 import { useBreakpoint } from '@/composables/useBreakpoint'
 import { useRouter } from 'vue-router'
 import { getStockNames } from '@/api/qmt'
-import { onMounted } from 'vue'
+import { watch } from 'vue'
 
 const router = useRouter()
 const account = useAccountStore()
@@ -74,6 +74,12 @@ const { isMobile } = useBreakpoint()
 
 function onRowClick(row: any) {
   router.push(`/position/${encodeURIComponent(row.stock_code)}`)
+}
+
+function sortByStockName(a: any, b: any): number {
+  const na = account.getStockName(a.stock_code)
+  const nb = account.getStockName(b.stock_code)
+  return na.localeCompare(nb, 'zh-CN')
 }
 
 function formatMoney(val: number | undefined): string {
@@ -92,16 +98,18 @@ function pnlClass(val: number | undefined): string {
   return val > 0 ? 'pnl-up' : val < 0 ? 'pnl-down' : ''
 }
 
-onMounted(async () => {
-  // 加载持仓股票名称
-  if (positions.value.length) {
-    const codes = positions.value.map(p => p.stock_code)
-    try {
-      const names = await getStockNames(codes)
-      account.setStockNames(names)
-    } catch { /* ignore */ }
-  }
-})
+async function fetchNames() {
+  const codes = positions.value
+    .map(p => p.stock_code)
+    .filter(c => !account.stockNames[c])
+  if (!codes.length) return
+  try {
+    const names = await getStockNames(codes)
+    account.setStockNames(names)
+  } catch { /* ignore */ }
+}
+
+watch(positions, () => fetchNames(), { immediate: true })
 </script>
 
 <style scoped>
@@ -123,4 +131,29 @@ onMounted(async () => {
 .pnl-up { color: #f56c6c; }
 .pnl-down { color: #67c23a; }
 :deep(.el-table) { cursor: pointer; }
+/* 排序图标默认隐藏，hover 时显示 */
+:deep(.el-table .caret-wrapper) {
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+:deep(.el-table .el-table__column-header:hover .caret-wrapper) {
+  opacity: 1;
+}
+/* 正在排序的列始终显示图标 */
+:deep(.el-table .ascending .caret-wrapper),
+:deep(.el-table .descending .caret-wrapper) {
+  opacity: 1;
+}
+:deep(.el-table .sort-caret.ascending) {
+  border-bottom-color: #c0c4cc;
+}
+:deep(.el-table .sort-caret.descending) {
+  border-top-color: #c0c4cc;
+}
+:deep(.el-table .ascending .sort-caret.ascending) {
+  border-bottom-color: #409eff;
+}
+:deep(.el-table .descending .sort-caret.descending) {
+  border-top-color: #409eff;
+}
 </style>

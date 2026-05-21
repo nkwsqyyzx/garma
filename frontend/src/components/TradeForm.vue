@@ -23,7 +23,7 @@
       <!-- 委托价格 -->
       <el-form-item label="委托价格">
         <div class="price-row">
-          <el-input-number v-model="form.price" :precision="2" :step="0.01" :min="0" style="flex: 1" />
+          <el-input-number v-model="form.price" :precision="pricePrecision" :step="priceStep" :min="0" style="flex: 1" />
           <el-button-group>
             <el-button size="small" @click="form.price = limitDown">跌停</el-button>
             <el-button size="small" @click="form.price = currentPrice">现价</el-button>
@@ -72,6 +72,10 @@ const props = defineProps<{
   prefillCode?: string
 }>()
 
+const emit = defineEmits<{
+  (e: 'codeChange', code: string): void
+}>()
+
 const account = useAccountStore()
 const { asset, positions } = storeToRefs(account)
 
@@ -80,7 +84,7 @@ const form = reactive({
   order_type: 'buy' as 'buy' | 'sell',
   price: 0,
   order_volume: 0,
-  price_type: 11, // LATEST_PRICE
+  price_type: 'limit', // limit / market / best5
 })
 
 const stockName = ref('')
@@ -88,6 +92,14 @@ const currentPrice = ref(0)
 const limitUp = ref(0)
 const limitDown = ref(0)
 const submitting = ref(false)
+
+function isETF(code: string): boolean {
+  const p = code.replace(/\.(SH|SZ)/, '')
+  return /^(51|15|16|50|52|56|58|59)/.test(p)
+}
+
+const pricePrecision = computed(() => isETF(form.stock_code) ? 3 : 2)
+const priceStep = computed(() => isETF(form.stock_code) ? 0.001 : 0.01)
 
 const maxVolume = computed(() => {
   if (form.order_type === 'sell') {
@@ -105,6 +117,7 @@ function calcMaxVolume() {
 
 async function onCodeChange() {
   const code = form.stock_code.trim()
+  emit('codeChange', code)
   if (!code) return
 
   // 获取名称

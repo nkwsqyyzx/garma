@@ -56,7 +56,7 @@ export async function placeOrder(params: {
   stock_code: string
   order_type: string
   order_volume: number
-  price_type: number
+  price_type: string
   price: number
   strategy_name?: string
   order_remark?: string

@@ -128,7 +128,24 @@ class QmtService:
             )
             data = resp.json()
             if data.get("code") == 0:
-                return data.get("data") or []
+                result = data.get("data") or []
+                # 首次查询无数据（ETF等），触发下载后重试
+                if not result:
+                    try:
+                        await self._market_http.post(
+                            "/quote/history",
+                            json={"code": code, "period": period, "count": count},
+                        )
+                        resp2 = await self._market_http.get(
+                            "/quote/kline",
+                            params={"code": code, "period": period, "count": count},
+                        )
+                        data2 = resp2.json()
+                        if data2.get("code") == 0:
+                            result = data2.get("data") or []
+                    except httpx.HTTPError:
+                        pass
+                return result
             return []
         except httpx.HTTPError as e:
             logger.error("Kline proxy failed: {}", e)

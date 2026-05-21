@@ -85,7 +85,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "mysql+aiomysql://root:password@127.0.0.1:3306/garma"
 
     # 服务端口
-    BACKEND_PORT: int = 8000
+    BACKEND_PORT: int = 8998
 
     model_config = {
         "env_file": str(_BACKEND_DIR / ".env"),
