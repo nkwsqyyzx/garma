@@ -745,98 +745,139 @@ class QmtService:
         #    匹配条件：stock_code + order_type + traded_volume == order_volume + price 接近
         inserted = 0
         trades_to_insert: list[StrategyTrade] = []
+        orders_to_update: dict[str, dict] = {}  # req_id -> {traded_price, traded_volume, order_id}
         used_trade_keys: set[str] = set()  # 避免同一条 trade 匹配多个 order
 
         for order in orders:
             if order.req_id in recorded_req_ids:
                 continue
 
-            # 在 Redis trades 中找匹配
+            # 优先通过 Redis trade 的 order_remark 中的 alpha: 前缀精确匹配
+            matched_trade = None
             for t in trades_raw:
-                # 基本条件匹配
-                if t.get("stock_code") != order.stock_code:
-                    continue
-                if (t.get("order_type") or "").lower() != order.order_type:
-                    continue
+                t_remark = t.get("order_remark") or ""
+                if t_remark.startswith("alpha:"):
+                    short_id = t_remark.split(":", 1)[1] if ":" in t_remark else ""
+                    if short_id and order.req_id.startswith(short_id):
+                        trade_key = f"{t.get('traded_id', '')}_{t.get('order_id', '')}"
+                        if trade_key not in used_trade_keys:
+                            matched_trade = (t, trade_key)
+                            break
 
-                trade_key = f"{t.get('traded_id', '')}_{t.get('order_id', '')}"
-                if trade_key in used_trade_keys:
-                    continue
+            # 回退：stock_code + order_type + volume + price 近似匹配
+            if not matched_trade:
+                for t in trades_raw:
+                    if t.get("stock_code") != order.stock_code:
+                        continue
+                    if (t.get("order_type") or "").lower() != order.order_type:
+                        continue
 
-                traded_volume = int(t.get("traded_volume", 0))
-                traded_price = float(t.get("traded_price", 0))
+                    trade_key = f"{t.get('traded_id', '')}_{t.get('order_id', '')}"
+                    if trade_key in used_trade_keys:
+                        continue
 
-                # volume 匹配（允许 order_volume 是 trade 的整数倍，取单笔）
-                if traded_volume <= 0 or traded_price <= 0:
-                    continue
-                if traded_volume != order.order_volume:
-                    continue
+                    traded_volume = int(t.get("traded_volume", 0))
+                    traded_price = float(t.get("traded_price", 0))
 
-                # price 近似匹配（容忍 0.5% 偏差）
-                order_price = float(order.price or 0)
-                if order_price > 0 and abs(traded_price - order_price) / order_price > 0.005:
-                    continue
+                    if traded_volume <= 0 or traded_price <= 0:
+                        continue
+                    if traded_volume != order.order_volume:
+                        continue
 
-                # 匹配成功 — 解析 strategy/factor
-                strategy, factor, remark = _parse_remark(order.order_remark)
-                if not strategy and order.strategy_name:
-                    strategy = order.strategy_name
-                # 卖出订单无 order_remark 时，从 linked buy order 继承
-                if not strategy and order.linked_req_id and order.linked_req_id in linked_buy_map:
-                    buy_order = linked_buy_map[order.linked_req_id]
-                    buy_strategy, buy_factor, buy_remark = _parse_remark(buy_order.order_remark)
-                    if not strategy:
-                        strategy = buy_strategy or buy_order.strategy_name
-                    if not factor:
-                        factor = buy_factor
-                    if not remark:
-                        remark = buy_remark
-                # 仍为空：从 strategy_trades 中查找 linked buy 的记录
-                if (not strategy or not factor) and order.linked_req_id and order.linked_req_id in linked_buy_st_map:
-                    st = linked_buy_st_map[order.linked_req_id]
-                    if not strategy:
-                        strategy = st.get("strategy")
-                    if not factor:
-                        factor = st.get("factor")
-                    if not remark:
-                        remark = st.get("remark")
+                    order_price = float(order.price or 0)
+                    if order_price > 0 and abs(traded_price - order_price) / order_price > 0.005:
+                        continue
 
-                direction = "buy" if order.order_type == "buy" else "sell"
-                trade_date_str = t.get("traded_time") or t.get("trade_time")
-                trade_date = date.today()
-                if trade_date_str:
-                    try:
-                        trade_date = date.fromisoformat(str(trade_date_str)[:10])
-                    except (ValueError, TypeError):
-                        pass
+                    matched_trade = (t, trade_key)
+                    break
 
-                trades_to_insert.append(StrategyTrade(
-                    account_id=order.account_id,
-                    stock_code=order.stock_code,
-                    stock_name=t.get("stock_name") or order.stock_name,
-                    direction=direction,
-                    volume=traded_volume,
-                    price=traded_price,
-                    amount=round(traded_volume * traded_price, 4),
-                    strategy=strategy,
-                    factor=factor,
-                    remark=remark,
-                    trade_date=trade_date,
-                    source="order",
-                    order_req_id=order.req_id,
-                    linked_req_id=order.linked_req_id,
-                ))
-                used_trade_keys.add(trade_key)
-                recorded_req_ids.add(order.req_id)
-                break  # 每个 order 只匹配一条 trade
+            if not matched_trade:
+                continue
 
-        # 5. 批量插入
+            t, trade_key = matched_trade
+            traded_volume = int(t.get("traded_volume", 0))
+            traded_price = float(t.get("traded_price", 0))
+
+            # 匹配成功 — 解析 strategy/factor
+            strategy, factor, remark = _parse_remark(order.order_remark)
+            if not strategy and order.strategy_name:
+                strategy = order.strategy_name
+            # 卖出订单无 order_remark 时，从 linked buy order 继承
+            if not strategy and order.linked_req_id and order.linked_req_id in linked_buy_map:
+                buy_order = linked_buy_map[order.linked_req_id]
+                buy_strategy, buy_factor, buy_remark = _parse_remark(buy_order.order_remark)
+                if not strategy:
+                    strategy = buy_strategy or buy_order.strategy_name
+                if not factor:
+                    factor = buy_factor
+                if not remark:
+                    remark = buy_remark
+            # 仍为空：从 strategy_trades 中查找 linked buy 的记录
+            if (not strategy or not factor) and order.linked_req_id and order.linked_req_id in linked_buy_st_map:
+                st = linked_buy_st_map[order.linked_req_id]
+                if not strategy:
+                    strategy = st.get("strategy")
+                if not factor:
+                    factor = st.get("factor")
+                if not remark:
+                    remark = st.get("remark")
+
+            direction = "buy" if order.order_type == "buy" else "sell"
+            trade_date_str = t.get("traded_time") or t.get("trade_time")
+            trade_date = date.today()
+            if trade_date_str:
+                try:
+                    trade_date = date.fromisoformat(str(trade_date_str)[:10])
+                except (ValueError, TypeError):
+                    pass
+
+            trades_to_insert.append(StrategyTrade(
+                account_id=order.account_id,
+                stock_code=order.stock_code,
+                stock_name=t.get("stock_name") or order.stock_name,
+                direction=direction,
+                volume=traded_volume,
+                price=traded_price,
+                amount=round(traded_volume * traded_price, 4),
+                strategy=strategy,
+                factor=factor,
+                remark=remark,
+                trade_date=trade_date,
+                source="order",
+                order_req_id=order.req_id,
+                linked_req_id=order.linked_req_id,
+            ))
+            # 记录需要更新 qmt_orders 的成交信息
+            update_vals: dict[str, Any] = {
+                "traded_price": traded_price,
+                "traded_volume": traded_volume,
+                "status": "filled",
+            }
+            if t.get("order_id"):
+                update_vals["order_id"] = t["order_id"]
+            orders_to_update[order.req_id] = update_vals
+            used_trade_keys.add(trade_key)
+            recorded_req_ids.add(order.req_id)
+
+        # 5. 批量插入 strategy_trades
         if trades_to_insert:
             async with self._db_session_factory() as session:
                 session.add_all(trades_to_insert)
                 await session.commit()
             inserted = len(trades_to_insert)
             logger.info("Reconciled {} strategy trades from account data", inserted)
+
+        # 6. 回写 qmt_orders 的成交信息
+        if orders_to_update:
+            async with self._db_session_factory() as session:
+                for req_id, vals in orders_to_update.items():
+                    await session.execute(
+                        update(QmtOrder)
+                        .where(QmtOrder.req_id == req_id)
+                        .values(**vals)
+                    )
+                await session.commit()
+            logger.info("Updated {} qmt_orders with fill data", len(orders_to_update))
 
         return inserted
 
