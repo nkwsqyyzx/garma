@@ -1,15 +1,15 @@
 """
 qmt-market 行情查询服务启动入口。
-FastAPI + MarketHub（xtdata 同步查询）+ StatusReporter 定时上报。
+FastAPI + MarketHub（xtdata 同步查询）。
 
 行情订阅已由旧实现（qmt_tick.py）接管，本服务仅提供按需查询 API。
+健康状态由外部系统写入 qmt:market:status Redis key。
 
 启动方式: python qmt-market/main.py
 """
 
 import json
 import logging
-import os
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -43,7 +43,6 @@ from fastapi import FastAPI, Request
 
 from shared.redis_bridge import RedisBridge
 from core.market_hub import MarketHub
-from core.status_reporter import StatusReporter
 from api.router import create_router
 
 logger = logging.getLogger(__name__)
@@ -137,12 +136,6 @@ async def lifespan(app: FastAPI):
     market_hub.start()
     logger.info("[OK] MarketHub 启动完成")
 
-    # 3. 初始化 StatusReporter
-    reporter = StatusReporter(redis_bridge, market_hub, config)
-    app.state.status_reporter = reporter
-    reporter.start()
-    logger.info("[OK] StatusReporter 启动完成")
-
     market_cfg = config.get("market_server", {})
     port = market_cfg.get("port", 3301)
     logger.info("[STARTUP] qmt-market 启动完成，监听 :%d", port)
@@ -152,30 +145,13 @@ async def lifespan(app: FastAPI):
     # ---- Shutdown（优雅关机）----
     logger.info("[SHUTDOWN] qmt-market 正在关机 ...")
 
-    # 1. 停止 StatusReporter
-    reporter: StatusReporter = app.state.status_reporter
-    if reporter:
-        reporter.stop()
-
-    # 2. 停止 MarketHub
+    # 1. 停止 MarketHub
     hub: MarketHub = app.state.market_hub
     if hub:
         hub.stop()
 
-    # 3. 等待后台线程退出
-    if reporter and reporter._thread and reporter._thread.is_alive():
-        reporter._thread.join(timeout=5)
-
-    # 4. 写入 shutting_down 状态（TTL=10s）
+    # 2. 关闭 Redis 连接池
     redis_bridge: RedisBridge = app.state.redis_bridge
-    if redis_bridge:
-        redis_bridge.raw.set(
-            "qmt:market:status",
-            '{"source":"market","overall_status":"shutting_down"}',
-            ex=10,
-        )
-
-    # 5. 关闭 Redis 连接池
     if redis_bridge:
         redis_bridge.close()
 
@@ -196,7 +172,6 @@ def create_app() -> FastAPI:
     app.state.config = config
     app.state.redis_bridge = None
     app.state.market_hub = None
-    app.state.status_reporter = None
 
     # 注册路由
     app.include_router(create_router())

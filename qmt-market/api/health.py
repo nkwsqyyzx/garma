@@ -1,7 +1,9 @@
 """
-健康检查 API：/health（xtdata 连接 + Redis 连通性）
+健康检查 API：/health
+读取 Redis 中的 qmt:market:status（由外部系统维护）。
 """
 
+import json
 import logging
 
 from fastapi import APIRouter, Request
@@ -14,7 +16,13 @@ router = APIRouter(tags=["health"])
 
 @router.get("/health")
 async def health_check(request: Request):
-    """行情服务健康状态（xtdata 连接 + Redis 连通性）"""
-    reporter = request.app.state.status_reporter
-    status = reporter.latest_status
+    """行情服务健康状态（从 Redis qmt:market:status 读取）"""
+    redis_bridge = request.app.state.redis_bridge
+    status = None
+    try:
+        raw = redis_bridge.raw.get("qmt:market:status")
+        if raw:
+            status = json.loads(raw)
+    except Exception:
+        logger.warning("[WARN] 读取 qmt:market:status 失败", exc_info=True)
     return ApiResponse(code=0, msg="ok", data=status)
