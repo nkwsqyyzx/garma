@@ -16,6 +16,7 @@ class QmtOrderRequest(BaseModel):
     price: float = Field(default=0.0, description="委托价格")
     strategy_name: str | None = Field(default=None, description="策略名称")
     order_remark: str | None = Field(default=None, description="委托备注")
+    linked_req_id: str | None = Field(default=None, description="关联买入的order_req_id(卖出时使用)")
 
 
 class QmtOrderResponse(BaseModel):

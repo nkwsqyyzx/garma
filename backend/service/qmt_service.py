@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 import redis
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from backend.config import (
     Settings,
@@ -33,10 +33,25 @@ from backend.config import (
     KEY_KILL_SWITCH,
 )
 from backend.models.qmt_order import QmtOrder
+from backend.models.strategy_trade import StrategyTrade
 from backend.schemas.qmt import (
     QmtHealthResponse,
     QmtServiceStatus,
 )
+
+
+def _parse_remark(remark: str | None) -> tuple[str | None, str | None, str | None]:
+    """解析 order_remark 为 (strategy, factor, remark)。
+
+    格式: 策略名:因子:序号:股票名  或  策略名$子策略:因子:序号:股票名
+    如果不匹配冒号分隔格式，返回 (None, None, 原始值)。
+    """
+    if not remark:
+        return None, None, None
+    parts = remark.split(":")
+    if len(parts) >= 4:
+        return parts[0], parts[1], remark
+    return None, None, remark
 
 
 # HTTP 透传路径黑名单（禁止 Alpha 端直接调用）
@@ -328,6 +343,7 @@ class QmtService:
                 price=request.price,
                 strategy_name=request.strategy_name,
                 order_remark=request.order_remark,
+                linked_req_id=request.linked_req_id,
                 status="DRAFT",
             )
             session.add(order)
@@ -344,6 +360,7 @@ class QmtService:
             "price": request.price,
             "strategy_name": request.strategy_name or "",
             "order_remark": request.order_remark or "",
+            "linked_req_id": request.linked_req_id or "",
             "retry_count": 0,
             "created_at": time.time(),
         }
@@ -537,6 +554,63 @@ class QmtService:
 
         logger.info("Order updated: req_id={} status={}", req_id, status)
 
+    async def record_strategy_trade(self, event: dict) -> None:
+        """订单成交时写入 strategy_trades 流水记录。"""
+        req_id = event.get("req_id")
+        status = event.get("status", "")
+        if not req_id:
+            return
+        # 仅在成交时记录
+        if status not in ("partial", "filled"):
+            return
+        traded_volume = event.get("traded_volume")
+        traded_price = event.get("traded_price")
+        if not traded_volume or traded_volume <= 0:
+            return
+
+        # 查 qmt_orders 获取完整的 strategy_name / order_remark
+        async with self._db_session_factory() as session:
+            result = await session.execute(
+                select(QmtOrder).where(QmtOrder.req_id == req_id)
+            )
+            order = result.scalar_one_or_none()
+
+        if not order:
+            logger.warning("record_strategy_trade: order not found req_id={}", req_id)
+            return
+
+        strategy, factor, remark = _parse_remark(order.order_remark)
+        # 如果 remark 解析不出 strategy，fallback 到 order.strategy_name
+        if not strategy and order.strategy_name:
+            strategy = order.strategy_name
+
+        volume = int(traded_volume)
+        price = float(traded_price or 0)
+        direction = "buy" if order.order_type == "buy" else "sell"
+
+        async with self._db_session_factory() as session:
+            trade = StrategyTrade(
+                account_id=order.account_id,
+                stock_code=order.stock_code,
+                stock_name=order.stock_name,
+                direction=direction,
+                volume=volume,
+                price=price,
+                amount=round(volume * price, 4),
+                strategy=strategy,
+                factor=factor,
+                remark=remark,
+                trade_date=date.today(),
+                source="order",
+                order_req_id=req_id,
+                linked_req_id=getattr(order, "linked_req_id", None),
+            )
+            session.add(trade)
+            await session.commit()
+
+        logger.info("Strategy trade recorded: req_id={} {} {} vol={} price={}",
+                     req_id, direction, order.stock_code, volume, price)
+
     # ------------------------------------------------------------------
     # Redis 异步包装（asyncio.to_thread 包装同步 redis 调用）
     # ------------------------------------------------------------------
@@ -572,48 +646,73 @@ class QmtService:
     # ------------------------------------------------------------------
 
     async def get_strategy_positions(self) -> list[dict]:
-        """从 qmt-market RPC 读取当天成交缓存中的 hold 列表，补充实时行情。"""
-        if not self._market_http:
-            return []
-        today = date.today().strftime("%Y%m%d")
-        key = f"{today}_成交缓存信息"
-        try:
-            resp = await self._market_http.get(f"/rpc/kv/{key}")
-            data = resp.json().get("data")
-            if not data or "hold" not in data:
-                return []
-        except httpx.HTTPError:
+        """从 strategy_trades 流水表聚合当前持仓，补充实时行情。"""
+        from sqlalchemy import func, case
+
+        async with self._db_session_factory() as session:
+            stmt = (
+                select(
+                    StrategyTrade.stock_code,
+                    StrategyTrade.strategy,
+                    StrategyTrade.factor,
+                    StrategyTrade.remark,
+                    StrategyTrade.trade_date,
+                    StrategyTrade.order_req_id,
+                    func.sum(
+                        case(
+                            (StrategyTrade.direction == "buy", StrategyTrade.volume),
+                            else_=-StrategyTrade.volume,
+                        )
+                    ).label("holding_volume"),
+                    func.sum(
+                        case(
+                            (StrategyTrade.direction == "buy", StrategyTrade.amount),
+                            else_=-StrategyTrade.amount,
+                        )
+                    ).label("total_cost"),
+                )
+                .where(StrategyTrade.account_id == self._config.QMT_ACCOUNT_ID)
+                .group_by(
+                    StrategyTrade.stock_code,
+                    StrategyTrade.strategy,
+                    StrategyTrade.factor,
+                    StrategyTrade.remark,
+                    StrategyTrade.trade_date,
+                    StrategyTrade.order_req_id,
+                )
+                .having(text("holding_volume > 0"))
+            )
+            result = await session.execute(stmt)
+            rows = result.all()
+
+        if not rows:
             return []
 
-        hold_list = data["hold"]
-        if not hold_list:
-            return []
-
-        # 收集所有证券代码，批量获取最新价
-        codes = list({item["证券代码"] for item in hold_list})
+        # 批量获取实时行情
+        codes = list({r.stock_code for r in rows})
         snapshot = await self.get_snapshot(codes)
 
         results = []
-        for item in hold_list:
-            code = item["证券代码"]
-            volume = item.get("持仓量", 0)
-            avg_price = item.get("成交均价", 0)
-            cost = volume * avg_price
-            tick = snapshot.get(code, {})
+        for r in rows:
+            volume = int(r.holding_volume)
+            total_cost = float(r.total_cost)
+            avg_price = total_cost / volume if volume > 0 else 0
+            tick = snapshot.get(r.stock_code, {})
             current_price = tick.get("last", avg_price)
             pct_change = tick.get("pct_change", 0)
             pnl = (current_price - avg_price) * volume if avg_price else 0
 
             results.append({
-                "stock_code": code,
+                "stock_code": r.stock_code,
                 "volume": volume,
-                "trade_date": item.get("交易日期", "")[:10],
+                "trade_date": str(r.trade_date),
                 "avg_price": avg_price,
-                "other": item.get("其他", ""),
-                "cost": cost,
+                "other": r.remark or "",
+                "cost": total_cost,
                 "pct_change": pct_change,
                 "current_price": current_price,
                 "pnl": pnl,
+                "order_req_id": r.order_req_id or "",
             })
         return results
 

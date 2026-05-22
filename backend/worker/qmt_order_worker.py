@@ -120,6 +120,13 @@ class QmtOrderWorker:
             if self._service:
                 await self._service.update_order_from_event(event)
 
+            # 写入策略成交流水
+            if status in ("partial", "filled") and self._service:
+                try:
+                    await self._service.record_strategy_trade(event)
+                except Exception:
+                    logger.exception("Failed to record strategy trade for req_id={}", req_id)
+
             # 成交/失败通知（预留企业微信接口）
             if status in ("filled", "rejected"):
                 await self._send_notification(event)

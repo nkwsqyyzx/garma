@@ -26,6 +26,7 @@ class QmtOrder(Base):
     status_msg: Mapped[str | None] = mapped_column(String(200), nullable=True, comment="状态说明")
     strategy_name: Mapped[str | None] = mapped_column(String(50), nullable=True, comment="策略名称")
     order_remark: Mapped[str | None] = mapped_column(String(200), nullable=True, comment="委托备注")
+    linked_req_id: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="关联买入的order_req_id(卖出时使用)")
     retry_count: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="0", comment="重试次数")
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default="CURRENT_TIMESTAMP", comment="创建时间")
     updated_at: Mapped[datetime] = mapped_column(

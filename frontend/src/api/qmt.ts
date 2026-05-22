@@ -102,6 +102,7 @@ export interface StrategyPosition {
   pct_change: number
   current_price: number
   pnl: number
+  order_req_id: string
 }
 
 export async function getStrategyPositions() {
