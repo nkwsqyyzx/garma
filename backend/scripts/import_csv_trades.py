@@ -100,6 +100,8 @@ def main():
 
         print(f"Import complete: {inserted} inserted, {skipped} skipped")
 
+        await db_mod.engine.dispose()
+
     asyncio.run(_import())
 
 

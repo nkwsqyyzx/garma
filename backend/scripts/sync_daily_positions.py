@@ -1,4 +1,7 @@
-"""盘后脚本：从 strategy_trades 聚合持仓快照写入 daily_positions。
+"""
+盘后脚本：从 strategy_trades 聚合持仓快照写入 daily_positions。
+
+推荐运行时间：开盘日的15:30
 
 用法:
     cd garma/
@@ -16,6 +19,8 @@ from pathlib import Path
 _GARMA_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_GARMA_ROOT) not in sys.path:
     sys.path.insert(0, str(_GARMA_ROOT))
+
+from backend.utils.wechat import send_text
 
 
 def _parse_date(val: str) -> date:
@@ -68,17 +73,14 @@ def main():
             await conn.run_sync(db_mod.Base.metadata.create_all)
 
         # 1. 聚合 strategy_trades → 当前持仓
-        #    卖出记录通过 linked_req_id 关联回买入的 order_req_id，
-        #    用 CASE 将卖出映射到买入分组键进行抵消
+        #    只用 stock_code + position_req_id 分组抵消买卖，
+        #    买入的元数据（remark/strategy/factor/trade_date）从买入记录取
         async with db_mod.async_session_factory() as session:
-            stmt = (
+            # 1a. 按 stock_code + position_req_id 聚合净持仓
+            holding_stmt = (
                 select(
                     StrategyTrade.stock_code,
-                    StrategyTrade.strategy,
-                    StrategyTrade.factor,
-                    StrategyTrade.remark,
                     func.coalesce(StrategyTrade.linked_req_id, StrategyTrade.order_req_id).label("position_req_id"),
-                    StrategyTrade.trade_date,
                     func.sum(
                         case(
                             (StrategyTrade.direction == "buy", StrategyTrade.volume),
@@ -87,36 +89,61 @@ def main():
                     ).label("holding_volume"),
                     func.sum(
                         case(
-                            (StrategyTrade.direction == "buy", StrategyTrade.amount),
-                            else_=-StrategyTrade.amount,
+                            (StrategyTrade.direction == "buy", StrategyTrade.volume),
+                            else_=0,
                         )
-                    ).label("total_cost"),
+                    ).label("buy_volume"),
+                    func.sum(
+                        case(
+                            (StrategyTrade.direction == "buy", StrategyTrade.amount),
+                            else_=0,
+                        )
+                    ).label("buy_cost"),
                 )
                 .where(StrategyTrade.account_id == account_id)
                 .group_by(
                     StrategyTrade.stock_code,
-                    StrategyTrade.strategy,
-                    StrategyTrade.factor,
-                    StrategyTrade.remark,
                     text("position_req_id"),
-                    StrategyTrade.trade_date,
                 )
                 .having(text("holding_volume > 0"))
             )
-            result = await session.execute(stmt)
-            rows = result.all()
+            holding_result = await session.execute(holding_stmt)
+            holdings = holding_result.all()
 
-        if not rows:
+        if not holdings:
             print(f"No open positions found for account {account_id}")
             return
 
+        # 1b. 取每条持仓对应买入记录的元数据
+        req_ids = [h.position_req_id for h in holdings]
+        buy_meta: dict[str, tuple] = {}  # req_id -> (strategy, factor, remark, trade_date)
+        async with db_mod.async_session_factory() as session:
+            meta_result = await session.execute(
+                select(
+                    StrategyTrade.order_req_id,
+                    StrategyTrade.strategy,
+                    StrategyTrade.factor,
+                    StrategyTrade.remark,
+                    StrategyTrade.trade_date,
+                )
+                .where(
+                    StrategyTrade.order_req_id.in_(req_ids),
+                    StrategyTrade.direction == "buy",
+                    StrategyTrade.account_id == account_id,
+                )
+            )
+            for row in meta_result.all():
+                buy_meta[row[0]] = (row[1], row[2], row[3], row[4])
+
         # 2. 获取最新股票名称（Redis 优先，remark 兜底）
-        codes = list({r.stock_code for r in rows})
+        codes = list({h.stock_code for h in holdings})
         redis_names = await asyncio.to_thread(_load_stock_names_from_redis, settings.REDIS_URL)
         name_map: dict[str, str] = {}
-        for r in rows:
-            if r.stock_code not in name_map:
-                name_map[r.stock_code] = redis_names.get(r.stock_code) or _name_from_remark(r.remark) or r.stock_code
+        for h in holdings:
+            if h.stock_code not in name_map:
+                meta = buy_meta.get(h.position_req_id)
+                remark = meta[2] if meta else None
+                name_map[h.stock_code] = redis_names.get(h.stock_code) or _name_from_remark(remark) or h.stock_code
 
         # 3. 删除该日期的旧快照
         async with db_mod.async_session_factory() as session:
@@ -131,24 +158,33 @@ def main():
         # 4. 写入新快照
         inserted = 0
         async with db_mod.async_session_factory() as session:
-            for r in rows:
-                volume = int(r.holding_volume)
-                total_cost = float(r.total_cost)
-                avg_price = round(total_cost / volume, 4) if volume > 0 else 0
+            for h in holdings:
+                volume = int(h.holding_volume)
+                # avg_price 取原始买入均价（不受卖出影响）
+                buy_volume = int(h.buy_volume)
+                buy_cost = float(h.buy_cost)
+                avg_price = round(buy_cost / buy_volume, 4) if buy_volume > 0 else 0
+                cost = round(avg_price * volume, 4)
+
+                meta = buy_meta.get(h.position_req_id)
+                strategy = meta[0] if meta else None
+                factor = meta[1] if meta else None
+                remark = meta[2] if meta else None
+                trade_date = meta[3] if meta else date.today()
 
                 pos = DailyPosition(
                     account_id=account_id,
                     snapshot_date=snapshot_date,
-                    stock_code=r.stock_code,
-                    stock_name=name_map.get(r.stock_code),
-                    strategy=r.strategy,
-                    factor=r.factor,
-                    remark=r.remark,
-                    order_req_id=r.position_req_id,
-                    buy_date=r.trade_date,
+                    stock_code=h.stock_code,
+                    stock_name=name_map.get(h.stock_code),
+                    strategy=strategy,
+                    factor=factor,
+                    remark=remark,
+                    order_req_id=h.position_req_id,
+                    buy_date=trade_date,
                     volume=volume,
                     avg_price=avg_price,
-                    cost=round(total_cost, 4),
+                    cost=cost,
                 )
                 session.add(pos)
                 inserted += 1
@@ -156,6 +192,44 @@ def main():
             await session.commit()
 
         print(f"Synced {inserted} positions to daily_positions for {snapshot_date}")
+
+        # 5. 比对券商持仓
+        import json
+        raw = await asyncio.to_thread(lambda: __import__('redis').from_url(settings.REDIS_URL).get('qmt:account:positions'))
+        if raw:
+            broker_positions = json.loads(raw)
+            broker_map: dict[str, int] = {p['stock_code']: int(p['volume']) for p in broker_positions if int(p.get('volume', 0)) > 0}
+
+            async with db_mod.async_session_factory() as session:
+                result = await session.execute(
+                    select(DailyPosition.stock_code, func.sum(DailyPosition.volume))
+                    .where(DailyPosition.snapshot_date == snapshot_date, DailyPosition.account_id == account_id)
+                    .group_by(DailyPosition.stock_code)
+                )
+                daily_map: dict[str, int] = {row[0]: int(row[1]) for row in result.all()}
+
+            all_codes = sorted(set(broker_map.keys()) | set(daily_map.keys()))
+            content = ''
+            has_diff = False
+            for code in all_codes:
+                bv = broker_map.get(code, 0)
+                dv = daily_map.get(code, 0)
+                diff = dv - bv
+                if diff != 0:
+                    if has_diff:
+                        content += '\n'
+                    content += f"  DIFF {code}: broker={bv} daily={dv} diff={diff:+d}"
+                    has_diff = True
+
+            if not has_diff:
+                print(f"Reconciliation OK: all {len(all_codes)} stocks matched")
+            else:
+                print(f"Reconciliation: {len(all_codes)} stocks checked, differences found above")
+                await send_text(content)
+        else:
+            print("Broker positions not available in Redis, skip reconciliation")
+
+        await db_mod.engine.dispose()
 
     asyncio.run(_sync())
 

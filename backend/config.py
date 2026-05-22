@@ -87,6 +87,9 @@ class Settings(BaseSettings):
     # 服务端口
     BACKEND_PORT: int = 8998
 
+    # 企业微信群机器人
+    WECHAT_WEBHOOK_KEY: str = ""
+
     model_config = {
         "env_file": str(_BACKEND_DIR / ".env"),
         "env_file_encoding": "utf-8",
