@@ -70,6 +70,7 @@ export async function placeOrder(params: {
   price: number
   strategy_name?: string
   order_remark?: string
+  linked_req_id?: string
 }) {
   return request<{ req_id: string }>('/trade/order', {
     method: 'POST',

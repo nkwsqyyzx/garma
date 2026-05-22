@@ -29,6 +29,7 @@ export interface PositionRow {
   current_price: number
   pnl: number
   rank: number
+  order_req_id: string
 }
 
 export interface StrategyGroup {
@@ -99,6 +100,7 @@ function groupByFactorAndStrategy(raw: StrategyPosition[]): FactorGroup[] {
       current_price: item.current_price,
       pnl: item.pnl,
       rank,
+      order_req_id: item.order_req_id,
     })
   }
 

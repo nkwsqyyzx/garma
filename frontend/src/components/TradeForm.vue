@@ -14,10 +14,36 @@
 
       <!-- 买卖方向 -->
       <el-form-item label="方向">
-        <el-radio-group v-model="form.order_type" @change="calcMaxVolume">
+        <el-radio-group v-model="form.order_type" @change="onOrderTypeChange">
           <el-radio-button value="buy" :class="{ 'btn-buy': form.order_type === 'buy' }">买入</el-radio-button>
           <el-radio-button value="sell" :class="{ 'btn-sell': form.order_type === 'sell' }">卖出</el-radio-button>
         </el-radio-group>
+      </el-form-item>
+
+      <!-- 策略信息（买入时显示） -->
+      <div v-if="form.order_type === 'buy'" class="strategy-row">
+        <el-form-item label="策略名" class="strategy-field">
+          <el-input v-model="buyStrategy" placeholder="如 人工选股$网格" />
+        </el-form-item>
+        <el-form-item label="因子" class="strategy-field">
+          <el-input v-model="buyFactor" placeholder="如 手工信号" />
+        </el-form-item>
+      </div>
+      <div v-if="form.order_type === 'buy' && buyRemarkPreview" class="remark-preview">
+        标记: {{ buyRemarkPreview }}
+      </div>
+
+      <!-- 策略持仓选择（卖出时显示） -->
+      <el-form-item v-if="form.order_type === 'sell' && strategyLots.length > 0" label="关联策略持仓">
+        <el-select v-model="selectedLotId" placeholder="选择关联的策略持仓" clearable style="width: 100%" @change="onLotChange">
+          <el-option
+            v-for="lot in strategyLots"
+            :key="lot.order_req_id"
+            :label="`${lot.strategy} | ${lot.volume}股 @ ${lot.avg_price.toFixed(2)} | ${lot.trade_date}`"
+            :value="lot.order_req_id"
+          />
+        </el-select>
+        <div v-if="selectedLotId" class="lot-hint">将关联 linked_req_id: {{ selectedLotId }}</div>
       </el-form-item>
 
       <!-- 委托价格 -->
@@ -64,7 +90,7 @@
 <script setup lang="ts">
 import { reactive, ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { getStockNames, getSnapshot, placeOrder } from '@/api/qmt'
+import { getStockNames, getSnapshot, getStrategyPositions, placeOrder } from '@/api/qmt'
 import { isETF } from '@/utils/format'
 import { useAccountStore } from '@/stores/account'
 import { storeToRefs } from 'pinia'
@@ -94,11 +120,70 @@ const limitUp = ref(0)
 const limitDown = ref(0)
 const submitting = ref(false)
 
+// Buy strategy fields
+const buyStrategy = ref('人工选股$网格')
+const buyFactor = ref('手工信号')
+const buyRemarkPreview = computed(() => {
+  if (!buyStrategy.value && !buyFactor.value) return ''
+  const name = stockName.value || form.stock_code
+  return `${buyStrategy.value || '-'}:${buyFactor.value || '-'}:0:${name}`
+})
+
 const pricePrecision = computed(() => isETF(form.stock_code) ? 3 : 2)
 const priceStep = computed(() => isETF(form.stock_code) ? 0.001 : 0.01)
 
+// Strategy position lots for sell
+interface StrategyLot {
+  order_req_id: string
+  strategy: string
+  volume: number
+  avg_price: number
+  trade_date: string
+}
+const strategyLots = ref<StrategyLot[]>([])
+const selectedLotId = ref<string>('')
+
+function parseStrategy(other: string): string {
+  return other.split(':')[0] || ''
+}
+
+async function loadStrategyLots(code: string) {
+  if (!code) {
+    strategyLots.value = []
+    selectedLotId.value = ''
+    return
+  }
+  try {
+    const all = await getStrategyPositions()
+    const matches = (all || []).filter(p => p.stock_code === code && p.volume > 0)
+    strategyLots.value = matches.map(p => ({
+      order_req_id: p.order_req_id,
+      strategy: parseStrategy(p.other),
+      volume: p.volume,
+      avg_price: p.avg_price,
+      trade_date: p.trade_date,
+    }))
+    if (strategyLots.value.length === 1) {
+      selectedLotId.value = strategyLots.value[0].order_req_id
+    } else {
+      selectedLotId.value = ''
+    }
+  } catch {
+    strategyLots.value = []
+    selectedLotId.value = ''
+  }
+}
+
+function onLotChange() {
+  form.order_volume = 0
+}
+
 const maxVolume = computed(() => {
   if (form.order_type === 'sell') {
+    if (selectedLotId.value) {
+      const lot = strategyLots.value.find(l => l.order_req_id === selectedLotId.value)
+      return lot?.volume || 0
+    }
     const pos = positions.value.find(p => p.stock_code === form.stock_code)
     return pos?.can_use_volume || 0
   }
@@ -107,8 +192,11 @@ const maxVolume = computed(() => {
   return Math.floor(cash / form.price / 100) * 100
 })
 
-function calcMaxVolume() {
+function onOrderTypeChange() {
   form.order_volume = 0
+  if (form.order_type === 'sell' && form.stock_code) {
+    loadStrategyLots(form.stock_code)
+  }
 }
 
 async function onCodeChange() {
@@ -139,6 +227,11 @@ async function onCodeChange() {
   } catch {
     // ignore
   }
+
+  // 卖出时加载策略持仓
+  if (form.order_type === 'sell') {
+    await loadStrategyLots(code)
+  }
 }
 
 async function onSubmit() {
@@ -159,13 +252,26 @@ async function onSubmit() {
 
   submitting.value = true
   try {
-    const result = await placeOrder({
+    const params: Parameters<typeof placeOrder>[0] = {
       stock_code: form.stock_code,
       order_type: form.order_type,
       order_volume: form.order_volume,
       price_type: form.price_type,
       price: form.price,
-    })
+    }
+    if (form.order_type === 'buy') {
+      if (buyStrategy.value) {
+        params.strategy_name = buyStrategy.value
+      }
+      if (buyStrategy.value || buyFactor.value) {
+        const name = stockName.value || form.stock_code
+        params.order_remark = `${buyStrategy.value || '-'}:${buyFactor.value || '-'}:0:${name}`
+      }
+    }
+    if (form.order_type === 'sell' && selectedLotId.value) {
+      params.linked_req_id = selectedLotId.value
+    }
+    const result = await placeOrder(params)
     ElMessage.success(`下单成功: ${result.req_id}`)
     form.order_volume = 0
   } catch (e: any) {
@@ -187,6 +293,10 @@ onMounted(() => {
 .stock-name { font-size: 13px; color: #909399; margin-top: 4px; }
 .price-row, .volume-row { display: flex; gap: 8px; align-items: center; }
 .max-volume-hint { font-size: 12px; color: #909399; margin-top: 4px; }
+.lot-hint { font-size: 12px; color: #909399; margin-top: 4px; }
+.remark-preview { font-size: 12px; color: #409eff; margin-top: -8px; margin-bottom: 12px; word-break: break-all; }
+.strategy-row { display: flex; gap: 8px; }
+.strategy-field { flex: 1; }
 .btn-buy :deep(.el-radio-button__inner) { color: #f56c6c; }
 .btn-sell :deep(.el-radio-button__inner) { color: #67c23a; }
 </style>

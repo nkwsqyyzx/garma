@@ -18,8 +18,7 @@ from typing import Any
 import httpx
 import redis
 from loguru import logger
-from sqlalchemy import select, text
-from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy import select, text, update
 from backend.config import (
     Settings,
     KEY_ACCOUNT_ASSET,
@@ -332,17 +331,59 @@ class QmtService:
         """下单：1) INSERT qmt_orders DRAFT  2) RPUSH 命令队列。"""
         req_id = f"alpha_{uuid.uuid4().hex[:16]}_{int(time.time())}"
 
+        # 卖出且带有 linked_req_id 时，从 strategy_trades 继承策略信息
+        strategy_name = request.strategy_name
+        order_remark = request.order_remark
+        stock_name = None
+
+        if (not strategy_name or not order_remark) and request.linked_req_id:
+            async with self._db_session_factory() as session:
+                result = await session.execute(
+                    select(
+                        StrategyTrade.strategy,
+                        StrategyTrade.factor,
+                        StrategyTrade.remark,
+                        StrategyTrade.stock_name,
+                    )
+                    .where(StrategyTrade.order_req_id == request.linked_req_id)
+                    .limit(1)
+                )
+                row = result.first()
+                if row:
+                    if not strategy_name and row[0]:
+                        strategy_name = row[0]
+                    if row[1] or row[2]:
+                        # 从继承的策略信息重建 order_remark
+                        factor = row[1] or "-"
+                        remark_base = row[2] or ""
+                        if not order_remark:
+                            # 尝试从 remark 中提取名称部分
+                            name = request.stock_code
+                            if remark_base and ":" in remark_base:
+                                parts = remark_base.split(":")
+                                if len(parts) >= 4:
+                                    name = parts[3]
+                            order_remark = f"{strategy_name or '-'}:{factor}:0:{name}"
+                    if row[3]:
+                        stock_name = row[3]
+
+        # stock_name 兜底：从 Redis 缓存获取
+        if not stock_name:
+            names = await self.get_stock_names([request.stock_code])
+            stock_name = names.get(request.stock_code) or None
+
         async with self._db_session_factory() as session:
             order = QmtOrder(
                 req_id=req_id,
                 account_id=self._config.QMT_ACCOUNT_ID,
                 stock_code=request.stock_code,
+                stock_name=stock_name,
                 order_type=request.order_type,
                 order_volume=request.order_volume,
                 price_type=request.price_type,
                 price=request.price,
-                strategy_name=request.strategy_name,
-                order_remark=request.order_remark,
+                strategy_name=strategy_name,
+                order_remark=order_remark,
                 linked_req_id=request.linked_req_id,
                 status="DRAFT",
             )
@@ -522,7 +563,7 @@ class QmtService:
     # ------------------------------------------------------------------
 
     async def update_order_from_event(self, event: dict) -> None:
-        """根据订单事件更新 MySQL，幂等（ON DUPLICATE KEY UPDATE）。"""
+        """根据订单事件更新 MySQL（纯 UPDATE，行不存在则跳过）。"""
         req_id = event.get("req_id")
         if not req_id:
             logger.warning("Order event missing req_id: {}", event)
@@ -538,21 +579,26 @@ class QmtService:
         if event.get("status_msg"):
             update_data["status_msg"] = event["status_msg"]
 
-        if status in ("partial", "filled"):
+        status_lower = status.lower()
+        if status_lower in ("partial", "filled"):
             if event.get("traded_volume") is not None:
                 update_data["traded_volume"] = event["traded_volume"]
             if event.get("traded_price") is not None:
                 update_data["traded_price"] = event["traded_price"]
 
         async with self._db_session_factory() as session:
-            stmt = mysql_insert(QmtOrder).values(req_id=req_id, **update_data)
-            stmt = stmt.on_duplicate_key_update(**{
-                k: stmt.inserted[k] for k in update_data
-            })
-            await session.execute(stmt)
+            stmt = (
+                update(QmtOrder)
+                .where(QmtOrder.req_id == req_id)
+                .values(**update_data)
+            )
+            result = await session.execute(stmt)
             await session.commit()
 
-        logger.info("Order updated: req_id={} status={}", req_id, status)
+        if result.rowcount > 0:
+            logger.info("Order updated: req_id={} status={}", req_id, status)
+        else:
+            logger.debug("Order not found, skip update: req_id={} status={}", req_id, status)
 
     async def record_strategy_trade(self, event: dict) -> None:
         """订单成交时写入 strategy_trades 流水记录。"""
@@ -560,8 +606,8 @@ class QmtService:
         status = event.get("status", "")
         if not req_id:
             return
-        # 仅在成交时记录
-        if status not in ("partial", "filled"):
+        # 仅在成交时记录（兼容大小写）
+        if status.lower() not in ("partial", "filled"):
             return
         traded_volume = event.get("traded_volume")
         traded_price = event.get("traded_price")
@@ -583,6 +629,22 @@ class QmtService:
         # 如果 remark 解析不出 strategy，fallback 到 order.strategy_name
         if not strategy and order.strategy_name:
             strategy = order.strategy_name
+        # 卖出订单仍无 strategy：从 linked buy 的 strategy_trades 继承
+        if (not strategy or not factor) and getattr(order, "linked_req_id", None):
+            async with self._db_session_factory() as session:
+                result = await session.execute(
+                    select(StrategyTrade.strategy, StrategyTrade.factor, StrategyTrade.remark)
+                    .where(StrategyTrade.order_req_id == order.linked_req_id)
+                    .limit(1)
+                )
+                row = result.first()
+                if row:
+                    if not strategy:
+                        strategy = row[0]
+                    if not factor:
+                        factor = row[1]
+                    if not remark:
+                        remark = row[2]
 
         volume = int(traded_volume)
         price = float(traded_price or 0)
@@ -610,6 +672,173 @@ class QmtService:
 
         logger.info("Strategy trade recorded: req_id={} {} {} vol={} price={}",
                      req_id, direction, order.stock_code, volume, price)
+
+    async def reconcile_strategy_trades(self) -> int:
+        """从 Redis qmt:account:trades 对账，补录缺失的 strategy_trades。
+
+        匹配逻辑：通过 stock_code + order_type + price 近似匹配 Redis 成交记录，
+        对于已有成交但 strategy_trades 中缺失的订单，补录流水。
+
+        Returns: 补录条数
+        """
+        # 1. 从 Redis 读取今日成交
+        trades_raw = await self._redis_get_json(KEY_ACCOUNT_TRADES)
+        if not isinstance(trades_raw, list) or not trades_raw:
+            return 0
+
+        # 2. 查所有今日的 qmt_orders（需要补录的候选）
+        async with self._db_session_factory() as session:
+            result = await session.execute(
+                select(QmtOrder).where(
+                    QmtOrder.created_at >= date.today(),
+                )
+            )
+            orders = result.scalars().all()
+
+        if not orders:
+            return 0
+
+        # 2b. 对于卖出订单（没有 order_remark），预加载 linked buy order 的信息
+        linked_buy_map: dict[str, QmtOrder] = {}
+        sell_req_ids = [o.req_id for o in orders if o.order_type == "sell" and o.linked_req_id]
+        if sell_req_ids:
+            async with self._db_session_factory() as session:
+                result = await session.execute(
+                    select(QmtOrder).where(QmtOrder.req_id.in_(
+                        {o.linked_req_id for o in orders if o.linked_req_id}
+                    ))
+                )
+                for lo in result.scalars().all():
+                    linked_buy_map[lo.req_id] = lo
+
+        # 2c. 查 strategy_trades 中 linked buy order 的 strategy/factor
+        linked_buy_st_map: dict[str, dict] = {}
+        linked_req_ids = {o.linked_req_id for o in orders if o.linked_req_id}
+        if linked_req_ids:
+            async with self._db_session_factory() as session:
+                result = await session.execute(
+                    select(
+                        StrategyTrade.order_req_id,
+                        StrategyTrade.strategy,
+                        StrategyTrade.factor,
+                        StrategyTrade.remark,
+                    ).where(StrategyTrade.order_req_id.in_(linked_req_ids))
+                )
+                for row in result.all():
+                    linked_buy_st_map[row[0]] = {
+                        "strategy": row[1],
+                        "factor": row[2],
+                        "remark": row[3],
+                    }
+
+        # 3. 查已有的 strategy_trades（source=order）的 order_req_id 集合
+        async with self._db_session_factory() as session:
+            result = await session.execute(
+                select(StrategyTrade.order_req_id).where(
+                    StrategyTrade.source == "order",
+                    StrategyTrade.order_req_id.in_([o.req_id for o in orders]),
+                )
+            )
+            recorded_req_ids: set[str] = {r[0] for r in result.all()}
+
+        # 4. 为每个未记录的 qmt_order，在 Redis trades 中找匹配
+        #    匹配条件：stock_code + order_type + traded_volume == order_volume + price 接近
+        inserted = 0
+        trades_to_insert: list[StrategyTrade] = []
+        used_trade_keys: set[str] = set()  # 避免同一条 trade 匹配多个 order
+
+        for order in orders:
+            if order.req_id in recorded_req_ids:
+                continue
+
+            # 在 Redis trades 中找匹配
+            for t in trades_raw:
+                # 基本条件匹配
+                if t.get("stock_code") != order.stock_code:
+                    continue
+                if (t.get("order_type") or "").lower() != order.order_type:
+                    continue
+
+                trade_key = f"{t.get('traded_id', '')}_{t.get('order_id', '')}"
+                if trade_key in used_trade_keys:
+                    continue
+
+                traded_volume = int(t.get("traded_volume", 0))
+                traded_price = float(t.get("traded_price", 0))
+
+                # volume 匹配（允许 order_volume 是 trade 的整数倍，取单笔）
+                if traded_volume <= 0 or traded_price <= 0:
+                    continue
+                if traded_volume != order.order_volume:
+                    continue
+
+                # price 近似匹配（容忍 0.5% 偏差）
+                order_price = float(order.price or 0)
+                if order_price > 0 and abs(traded_price - order_price) / order_price > 0.005:
+                    continue
+
+                # 匹配成功 — 解析 strategy/factor
+                strategy, factor, remark = _parse_remark(order.order_remark)
+                if not strategy and order.strategy_name:
+                    strategy = order.strategy_name
+                # 卖出订单无 order_remark 时，从 linked buy order 继承
+                if not strategy and order.linked_req_id and order.linked_req_id in linked_buy_map:
+                    buy_order = linked_buy_map[order.linked_req_id]
+                    buy_strategy, buy_factor, buy_remark = _parse_remark(buy_order.order_remark)
+                    if not strategy:
+                        strategy = buy_strategy or buy_order.strategy_name
+                    if not factor:
+                        factor = buy_factor
+                    if not remark:
+                        remark = buy_remark
+                # 仍为空：从 strategy_trades 中查找 linked buy 的记录
+                if (not strategy or not factor) and order.linked_req_id and order.linked_req_id in linked_buy_st_map:
+                    st = linked_buy_st_map[order.linked_req_id]
+                    if not strategy:
+                        strategy = st.get("strategy")
+                    if not factor:
+                        factor = st.get("factor")
+                    if not remark:
+                        remark = st.get("remark")
+
+                direction = "buy" if order.order_type == "buy" else "sell"
+                trade_date_str = t.get("traded_time") or t.get("trade_time")
+                trade_date = date.today()
+                if trade_date_str:
+                    try:
+                        trade_date = date.fromisoformat(str(trade_date_str)[:10])
+                    except (ValueError, TypeError):
+                        pass
+
+                trades_to_insert.append(StrategyTrade(
+                    account_id=order.account_id,
+                    stock_code=order.stock_code,
+                    stock_name=t.get("stock_name") or order.stock_name,
+                    direction=direction,
+                    volume=traded_volume,
+                    price=traded_price,
+                    amount=round(traded_volume * traded_price, 4),
+                    strategy=strategy,
+                    factor=factor,
+                    remark=remark,
+                    trade_date=trade_date,
+                    source="order",
+                    order_req_id=order.req_id,
+                    linked_req_id=order.linked_req_id,
+                ))
+                used_trade_keys.add(trade_key)
+                recorded_req_ids.add(order.req_id)
+                break  # 每个 order 只匹配一条 trade
+
+        # 5. 批量插入
+        if trades_to_insert:
+            async with self._db_session_factory() as session:
+                session.add_all(trades_to_insert)
+                await session.commit()
+            inserted = len(trades_to_insert)
+            logger.info("Reconciled {} strategy trades from account data", inserted)
+
+        return inserted
 
     # ------------------------------------------------------------------
     # Redis 异步包装（asyncio.to_thread 包装同步 redis 调用）

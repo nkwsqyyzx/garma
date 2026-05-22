@@ -32,6 +32,7 @@ Append-only trade journal. Every buy/sell generates one row.
 | `trade_date` | DATE | NO | | Trade execution date |
 | `source` | VARCHAR(20) | NO | `order` | Origin: `order` (callback), `import` (CSV), `manual` |
 | `order_req_id` | VARCHAR(64) | YES | NULL | Foreign key to `qmt_orders.req_id` |
+| `linked_req_id` | VARCHAR(64) | YES | NULL | Links sell record to the original buy `order_req_id` |
 | `created_at` | DATETIME | NO | `CURRENT_TIMESTAMP` | Row creation time |
 
 **Indexes:**
@@ -80,11 +81,12 @@ QmtOrderWorker._handle_message()
 Called when order status is `filled` or `partial` (with traded_volume > 0).
 
 1. Extract `req_id` from event.
-2. Query `qmt_orders` by `req_id` to get `strategy_name`, `order_remark`, `stock_code`, `stock_name`, `order_type`.
+2. Query `qmt_orders` by `req_id` to get `strategy_name`, `order_remark`, `stock_code`, `stock_name`, `order_type`, `linked_req_id`.
 3. Parse `order_remark` to extract strategy, factor, remark (see parsing convention in 1.1).
 4. Use `order_type` as direction (`buy`/`sell`).
 5. Use `traded_price` as price, `traded_volume` as volume.
-6. Insert into `strategy_trades`.
+6. If selling, store `linked_req_id` from the order to link this sell to the original buy position.
+7. Insert into `strategy_trades`.
 
 If the `qmt_orders` row is not found (edge case: order not in our system), skip silently and log a warning.
 
@@ -135,7 +137,8 @@ async def get_strategy_positions(self) -> list[dict]:
       "cost": 100270.0,
       "pct_change": -2.5,
       "current_price": 30.55,
-      "pnl": -2510.0
+      "pnl": -2510.0,
+      "order_req_id": "日内择时+20260521盘中9030800"
     }
   ]
 }
@@ -162,6 +165,7 @@ File: `backend/scripts/import_csv_trades.py`
   - `其他` → parse for strategy/factor/remark, also store as `remark`
   - `策略` → `strategy`
   - `因子` → `factor`
+  - `订单标记` → `order_req_id`
 - Idempotent: skip if row with same (account_id, stock_code, direction, volume, price, trade_date, strategy, factor) already exists
 - Run: `python -m backend.scripts.import_csv_trades /tmp/1/b.csv`
 

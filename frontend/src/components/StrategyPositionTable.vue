@@ -82,6 +82,11 @@
             </template>
           </el-table-column>
           <el-table-column prop="trade_date" label="交易日期" width="110" />
+          <el-table-column label="操作" width="80" align="center">
+            <template #default="{ row }">
+              <el-button type="success" size="small" text @click.stop="openSellDialog(row)">卖出</el-button>
+            </template>
+          </el-table-column>
         </el-table>
 
         <!-- Mobile: card list -->
@@ -101,20 +106,56 @@
               <div class="card-right">
                 <div :class="['card-pnl', pnlClass(p.pnl)]">{{ formatPct(p.pct_change) }}</div>
                 <div class="card-value">{{ formatMoney(p.pnl) }}</div>
+                <el-button type="success" size="small" text @click.stop="openSellDialog(p)" style="margin-top: 4px">卖出</el-button>
               </div>
             </div>
           </el-card>
         </div>
       </div>
     </template>
+
+    <!-- Sell dialog -->
+    <el-dialog v-model="sellDialogVisible" title="卖出持仓" width="420px" :close-on-click-modal="false">
+      <el-form label-position="top" size="default" v-if="sellTarget">
+        <el-form-item label="股票">
+          <el-input :model-value="`${sellTarget.stock_name} (${sellTarget.stock_code})`" disabled />
+        </el-form-item>
+        <el-form-item label="持仓量">
+          <el-input :model-value="sellTarget.volume.toLocaleString()" disabled />
+        </el-form-item>
+        <el-form-item label="委托价格">
+          <div class="sell-price-row">
+            <el-input-number v-model="sellForm.price" :precision="2" :step="0.01" :min="0" style="flex: 1" />
+            <el-button size="small" @click="sellForm.price = sellTarget.current_price || 0">现价</el-button>
+          </div>
+        </el-form-item>
+        <el-form-item label="卖出数量">
+          <div class="sell-volume-row">
+            <el-input-number v-model="sellForm.volume" :step="100" :min="100" :max="sellTarget.volume" style="flex: 1" />
+            <el-button-group>
+              <el-button size="small" @click="sellForm.volume = Math.floor(sellTarget.volume / 4 / 100) * 100">1/4</el-button>
+              <el-button size="small" @click="sellForm.volume = Math.floor(sellTarget.volume / 3 / 100) * 100">1/3</el-button>
+              <el-button size="small" @click="sellForm.volume = Math.floor(sellTarget.volume / 2 / 100) * 100">1/2</el-button>
+              <el-button size="small" @click="sellForm.volume = sellTarget.volume">全部</el-button>
+            </el-button-group>
+          </div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="sellDialogVisible = false">取消</el-button>
+        <el-button type="success" :loading="sellSubmitting" @click="onSellSubmit">确认卖出</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useBreakpoint } from '@/composables/useBreakpoint'
 import { formatMoney, formatPct, pnlClass } from '@/utils/format'
-import type { FactorGroup } from '@/views/StrategyPositions.vue'
+import { placeOrder } from '@/api/qmt'
+import type { FactorGroup, PositionRow } from '@/views/StrategyPositions.vue'
 
 const props = defineProps<{
   factors: FactorGroup[]
@@ -160,6 +201,58 @@ function toggleFactor(factor: string) {
     next.add(factor)
   }
   selectedFactors.value = next
+}
+
+// Sell dialog
+const sellDialogVisible = ref(false)
+const sellTarget = ref<PositionRow | null>(null)
+const sellSubmitting = ref(false)
+const sellForm = ref({ price: 0, volume: 0 })
+
+function openSellDialog(row: PositionRow) {
+  sellTarget.value = row
+  sellForm.value = {
+    price: row.current_price || row.avg_price,
+    volume: row.volume,
+  }
+  sellDialogVisible.value = true
+}
+
+async function onSellSubmit() {
+  const target = sellTarget.value
+  if (!target || sellForm.value.price <= 0 || sellForm.value.volume <= 0) {
+    ElMessage.warning('请填写完整的卖出信息')
+    return
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      `确认卖出 ${target.stock_name || target.stock_code} ${sellForm.value.volume}股 @ ${sellForm.value.price}`,
+      '确认卖出',
+      { confirmButtonText: '确认', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch {
+    return
+  }
+
+  sellSubmitting.value = true
+  try {
+    const result = await placeOrder({
+      stock_code: target.stock_code,
+      order_type: 'sell',
+      order_volume: sellForm.value.volume,
+      price_type: 'limit',
+      price: sellForm.value.price,
+      linked_req_id: target.order_req_id,
+    })
+    ElMessage.success(`卖出委托已提交: ${result.req_id}`)
+    sellDialogVisible.value = false
+    emit('rowClick', target.stock_code)
+  } catch (e: any) {
+    ElMessage.error(e.message || '卖出失败')
+  } finally {
+    sellSubmitting.value = false
+  }
 }
 </script>
 
@@ -225,6 +318,8 @@ function toggleFactor(factor: string) {
 /* PnL colors */
 .pnl-up { color: #f56c6c; }
 .pnl-down { color: #67c23a; }
+/* Sell dialog */
+.sell-price-row, .sell-volume-row { display: flex; gap: 8px; align-items: center; }
 /* Mobile cards */
 .position-card {
   margin-bottom: 8px;

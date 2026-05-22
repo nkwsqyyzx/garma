@@ -21,6 +21,7 @@ class QmtOrderWorker:
         self._service = qmt_service  # QmtService 实例
         self._task: asyncio.Task | None = None
         self._running = False
+        self._reconcile_counter = 0
 
     def start(self) -> asyncio.Task:
         self._running = True
@@ -75,11 +76,26 @@ class QmtOrderWorker:
                     block=2000,
                 )
                 if not results:
+                    # 无事件时，每 5 个周期（~10s）做一次成交对账
+                    self._reconcile_counter += 1
+                    if self._reconcile_counter >= 5 and self._service:
+                        self._reconcile_counter = 0
+                        try:
+                            await self._service.reconcile_strategy_trades()
+                        except Exception:
+                            logger.exception("Strategy trade reconciliation failed")
                     continue
 
                 for stream_name, messages in results:
                     for msg_id, fields in messages:
                         await self._handle_message(msg_id, fields)
+
+                # 处理完事件后也做一次对账
+                if self._service:
+                    try:
+                        await self._service.reconcile_strategy_trades()
+                    except Exception:
+                        logger.exception("Strategy trade reconciliation failed")
 
             except asyncio.CancelledError:
                 break
@@ -96,17 +112,13 @@ class QmtOrderWorker:
     async def _handle_message(self, msg_id: str, fields: dict) -> None:
         """处理单条订单事件消息。"""
         try:
-            # fields 中 data 字段包含 JSON
+            # 兼容两种格式：嵌套 JSON（data/event 字段）或扁平字段
             raw = fields.get("data") or fields.get("event")
-            if not raw:
-                logger.warning("Empty event data in msg {}", msg_id)
-                await self._ack(msg_id)
-                return
-
-            if isinstance(raw, str):
-                event = json.loads(raw)
+            if raw:
+                event = json.loads(raw) if isinstance(raw, str) else raw
             else:
-                event = raw
+                # qmt-trade 直接将字段扁平放在 stream message 中
+                event = fields
 
             req_id = event.get("req_id")
             status = event.get("status", "")
@@ -120,15 +132,16 @@ class QmtOrderWorker:
             if self._service:
                 await self._service.update_order_from_event(event)
 
-            # 写入策略成交流水
-            if status in ("partial", "filled") and self._service:
+            # 写入策略成交流水（状态统一小写比较）
+            status_lower = status.lower()
+            if status_lower in ("partial", "filled") and self._service:
                 try:
                     await self._service.record_strategy_trade(event)
                 except Exception:
                     logger.exception("Failed to record strategy trade for req_id={}", req_id)
 
             # 成交/失败通知（预留企业微信接口）
-            if status in ("filled", "rejected"):
+            if status_lower in ("filled", "rejected"):
                 await self._send_notification(event)
 
             # 处理成功 → ACK
