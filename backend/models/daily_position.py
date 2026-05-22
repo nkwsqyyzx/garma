@@ -21,6 +21,7 @@ class DailyPosition(Base):
     strategy: Mapped[str | None] = mapped_column(String(100), nullable=True, comment="策略名")
     factor: Mapped[str | None] = mapped_column(String(50), nullable=True, comment="因子")
     remark: Mapped[str | None] = mapped_column(String(200), nullable=True, comment="备注")
+    order_req_id: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="关联买入的order_req_id")
     buy_date: Mapped[date] = mapped_column(Date, nullable=False, comment="买入日期")
     volume: Mapped[int] = mapped_column(Integer, nullable=False, comment="持仓量")
     avg_price: Mapped[float] = mapped_column(DECIMAL(12, 4), nullable=False, comment="加权均价")
@@ -29,7 +30,7 @@ class DailyPosition(Base):
 
     __table_args__ = (
         UniqueConstraint(
-            "snapshot_date", "account_id", "stock_code", "strategy", "factor", "buy_date",
+            "snapshot_date", "account_id", "stock_code", "strategy", "factor", "order_req_id", "buy_date",
             name="uk_snapshot_account_stock_strategy_buy",
         ),
     )
