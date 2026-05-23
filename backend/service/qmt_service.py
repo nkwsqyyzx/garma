@@ -918,6 +918,7 @@ class QmtService:
     async def get_strategy_positions(self) -> list[dict]:
         """从 strategy_trades 流水表聚合当前持仓，补充实时行情。"""
         from sqlalchemy import func, case
+        from backend.utils.adjustment import get_adjustment_factors, calc_adjusted_return
 
         async with self._db_session_factory() as session:
             stmt = (
@@ -962,6 +963,9 @@ class QmtService:
         codes = list({r.stock_code for r in rows})
         snapshot = await self.get_snapshot(codes)
 
+        # 批量获取复权因子
+        adj_factors = await get_adjustment_factors(codes, self._config.REDIS_URL)
+
         results = []
         for r in rows:
             volume = int(r.holding_volume)
@@ -970,7 +974,11 @@ class QmtService:
             tick = snapshot.get(r.stock_code, {})
             current_price = tick.get("last", avg_price)
             pct_change = tick.get("pct_change", 0)
-            pnl = (current_price - avg_price) * volume if avg_price else 0
+            adj_ret = calc_adjusted_return(
+                avg_price, current_price, r.trade_date,
+                adj_factors.get(r.stock_code, []),
+            )
+            pnl = total_cost * adj_ret
 
             results.append({
                 "stock_code": r.stock_code,

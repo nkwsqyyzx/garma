@@ -193,6 +193,41 @@ def main():
 
         print(f"Synced {inserted} positions to daily_positions for {snapshot_date}")
 
+        # 4b. 计算复权盈亏概览
+        from backend.utils.adjustment import get_adjustment_factors, calc_adjusted_return
+        adj_factors = await get_adjustment_factors(codes, settings.REDIS_URL)
+
+        # 从 Redis 获取最新收盘价
+        import json as _json
+        snapshot_raw = await asyncio.to_thread(
+            lambda: __import__('redis').from_url(settings.REDIS_URL).get('qmt:account:snapshot')
+        )
+        price_map: dict[str, float] = {}
+        if snapshot_raw:
+            try:
+                for item in _json.loads(snapshot_raw):
+                    price_map[item.get("code", "")] = float(item.get("last", 0))
+            except Exception:
+                pass
+
+        total_pnl = 0.0
+        for h in holdings:
+            meta = buy_meta.get(h.position_req_id)
+            trade_date = meta[3] if meta else date.today()
+            buy_volume = int(h.buy_volume)
+            buy_cost = float(h.buy_cost)
+            avg_price = buy_cost / buy_volume if buy_volume > 0 else 0
+            current_price = price_map.get(h.stock_code, 0)
+            if current_price > 0 and avg_price > 0:
+                adj_ret = calc_adjusted_return(
+                    avg_price, current_price, trade_date,
+                    adj_factors.get(h.stock_code, []),
+                )
+                pnl = buy_cost * adj_ret
+                total_pnl += pnl
+                print(f"  {h.stock_code}: adj_ret={adj_ret:+.4%} pnl={pnl:+.2f} (buy={avg_price:.4f} cur={current_price:.4f})")
+        print(f"Total adjusted PnL: {total_pnl:+.2f}")
+
         # 5. 比对券商持仓
         import json
         raw = await asyncio.to_thread(lambda: __import__('redis').from_url(settings.REDIS_URL).get('qmt:account:positions'))
