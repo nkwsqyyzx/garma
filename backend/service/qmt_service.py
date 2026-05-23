@@ -1072,6 +1072,125 @@ class QmtService:
         return results
 
     # ------------------------------------------------------------------
+    # 策略成交
+    # ------------------------------------------------------------------
+
+    async def get_strategy_trades(self, trade_date: date | None = None) -> list[dict]:
+        """从 strategy_trades 查询成交流水，补充实时行情（仅买入）。"""
+        from sqlalchemy import func
+        from backend.utils.adjustment import get_adjustment_factors, calc_adjusted_return
+
+        async with self._db_session_factory() as session:
+            # 确定查询日期：优先指定日期，否则取最大交易日
+            if trade_date is None:
+                trade_date = date.today()
+
+            stmt = (
+                select(StrategyTrade)
+                .where(StrategyTrade.account_id == self._config.QMT_ACCOUNT_ID)
+                .where(StrategyTrade.trade_date == trade_date)
+                .order_by(StrategyTrade.id)
+            )
+            result = await session.execute(stmt)
+            rows = result.scalars().all()
+
+            # 无结果时回退到最近交易日
+            if not rows:
+                max_date_stmt = (
+                    select(func.max(StrategyTrade.trade_date))
+                    .where(StrategyTrade.account_id == self._config.QMT_ACCOUNT_ID)
+                )
+                max_result = await session.execute(max_date_stmt)
+                max_date = max_result.scalar()
+                if max_date and max_date != trade_date:
+                    stmt = (
+                        select(StrategyTrade)
+                        .where(StrategyTrade.account_id == self._config.QMT_ACCOUNT_ID)
+                        .where(StrategyTrade.trade_date == max_date)
+                        .order_by(StrategyTrade.id)
+                    )
+                    result = await session.execute(stmt)
+                    rows = result.scalars().all()
+
+            # 构建买入价映射：用于计算卖出盈亏
+            buy_price_map: dict[str, float] = {}
+            for r in rows:
+                if r.direction == "buy" and r.order_req_id:
+                    buy_price_map[r.order_req_id] = float(r.price)
+
+            # 补查不在当前结果中的 linked 买入价
+            missing_req_ids = list({
+                r.linked_req_id for r in rows
+                if r.direction == "sell" and r.linked_req_id and r.linked_req_id not in buy_price_map
+            })
+            if missing_req_ids:
+                supp_stmt = (
+                    select(StrategyTrade.order_req_id, StrategyTrade.price)
+                    .where(StrategyTrade.order_req_id.in_(missing_req_ids))
+                    .where(StrategyTrade.direction == "buy")
+                )
+                supp_result = await session.execute(supp_stmt)
+                for row in supp_result:
+                    buy_price_map[row[0]] = float(row[1])
+
+        if not rows:
+            return []
+
+        # 补齐 stock_name：对缺失名称的股票批量查询
+        all_codes = list({r.stock_code for r in rows})
+        missing_codes = [c for c in all_codes if not next(
+            (r.stock_name for r in rows if r.stock_code == c), None
+        )]
+        name_map = await self.get_stock_names(missing_codes) if missing_codes else {}
+
+        # 分离买入/卖出记录
+        buy_codes = list({r.stock_code for r in rows if r.direction == "buy"})
+        snapshot = await self.get_snapshot(buy_codes) if buy_codes else {}
+        adj_factors = (
+            await get_adjustment_factors(buy_codes, self._config.REDIS_URL)
+            if buy_codes else {}
+        )
+
+        results = []
+        for r in rows:
+            entry = {
+                "stock_code": r.stock_code,
+                "stock_name": r.stock_name or name_map.get(r.stock_code, ""),
+                "direction": r.direction,
+                "price": float(r.price),
+                "volume": int(r.volume),
+                "amount": float(r.amount),
+                "strategy": r.strategy or "",
+                "factor": r.factor or "",
+                "trade_date": str(r.trade_date),
+                "pct_change": 0,
+                "pnl": 0,
+            }
+
+            if r.direction == "buy":
+                tick = snapshot.get(r.stock_code, {})
+                current_price = tick.get("last", float(r.price))
+                pct_change = tick.get("pct_change", 0)
+                adj_ret = calc_adjusted_return(
+                    float(r.price), current_price, r.trade_date,
+                    adj_factors.get(r.stock_code, []),
+                )
+                pnl = float(r.amount) * adj_ret
+                entry["pct_change"] = pct_change
+                entry["pnl"] = pnl
+            elif r.direction == "sell" and r.linked_req_id:
+                buy_price = buy_price_map.get(r.linked_req_id)
+                if buy_price and buy_price > 0:
+                    sell_price = float(r.price)
+                    pnl = (sell_price - buy_price) * int(r.volume)
+                    pct_change = ((sell_price - buy_price) / buy_price) * 100
+                    entry["pct_change"] = pct_change
+                    entry["pnl"] = pnl
+
+            results.append(entry)
+        return results
+
+    # ------------------------------------------------------------------
     # 关闭
     # ------------------------------------------------------------------
 

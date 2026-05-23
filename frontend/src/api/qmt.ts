@@ -109,3 +109,24 @@ export interface StrategyPosition {
 export async function getStrategyPositions() {
   return request<StrategyPosition[]>('/strategy/positions')
 }
+
+// ── 策略成交 ─────────────────────────────────────────
+
+export interface StrategyTrade {
+  stock_code: string
+  stock_name: string
+  direction: string
+  price: number
+  volume: number
+  amount: number
+  strategy: string
+  factor: string
+  trade_date: string
+  pct_change: number
+  pnl: number
+}
+
+export async function getStrategyTrades(tradeDate?: string) {
+  const params = tradeDate ? `?trade_date=${tradeDate}` : ''
+  return request<StrategyTrade[]>(`/strategy/trades${params}`)
+}

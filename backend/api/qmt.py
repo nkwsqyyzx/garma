@@ -1,5 +1,7 @@
 """QMT API 路由。"""
 
+from datetime import date
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from backend.config import get_settings, Settings
@@ -188,6 +190,16 @@ async def strategy_positions(
 ):
     """策略持仓：从 qmt-market RPC 读取当天成交缓存。"""
     data = await svc.get_strategy_positions()
+    return _api_ok(data)
+
+
+@router.get("/strategy/trades")
+async def strategy_trades(
+    trade_date: date | None = Query(None, description="交易日期，如 2026-05-22"),
+    svc: QmtService = Depends(get_qmt_service),
+):
+    """策略成交：从 strategy_trades 表查询成交流水。"""
+    data = await svc.get_strategy_trades(trade_date=trade_date)
     return _api_ok(data)
 
 
