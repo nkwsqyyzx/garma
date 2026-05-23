@@ -92,17 +92,40 @@ class QmtService:
     # 旧行情 Redis 读取（qmt_tick:{date}:{code}）
     # ------------------------------------------------------------------
 
+    def _find_latest_tick_date(self) -> str | None:
+        """查找最近有 tick 数据的交易日（最多回溯 7 天）。"""
+        from datetime import timedelta
+        today = date.today()
+        for i in range(7):
+            d = today - timedelta(days=i)
+            d_str = d.strftime("%Y%m%d")
+            # 用第一只股票的 key 探测即可，或者直接 keys 数量
+            if self._tick_redis.exists(f"qmt_tick:{d_str}:*"):
+                return d_str
+            # exists 不支持通配符，改用 scan
+            _, keys = self._tick_redis.scan(
+                cursor=0, match=f"qmt_tick:{d_str}:*", count=1
+            )
+            if keys:
+                return d_str
+        return None
+
     async def get_snapshot(self, codes: list[str]) -> dict:
         """批量获取 Tick 快照，从旧行情 Redis 读取最新 tick。"""
         if not codes:
             return {}
         import asyncio as _aio
-        today = date.today().strftime("%Y%m%d")
+
+        # 今天没数据时往前找最近的交易日
+        tick_date = await _aio.to_thread(self._find_latest_tick_date)
+        if not tick_date:
+            return {}
+
         # pipeline 批量读每个股票的最新一条 tick
         def _batch_read():
             pipe = self._tick_redis.pipeline(transaction=False)
             for code in codes:
-                pipe.lrange(f"qmt_tick:{today}:{code}", -1, -1)
+                pipe.lrange(f"qmt_tick:{tick_date}:{code}", -1, -1)
             return pipe.execute()
 
         results = await _aio.to_thread(_batch_read)
@@ -119,9 +142,11 @@ class QmtService:
     async def get_tick(self, code: str) -> dict | None:
         """获取单只股票最新 Tick。"""
         import asyncio as _aio
-        today = date.today().strftime("%Y%m%d")
+        tick_date = await _aio.to_thread(self._find_latest_tick_date)
+        if not tick_date:
+            return None
         raw_list = await _aio.to_thread(
-            self._tick_redis.lrange, f"qmt_tick:{today}:{code}", -1, -1
+            self._tick_redis.lrange, f"qmt_tick:{tick_date}:{code}", -1, -1
         )
         if not raw_list:
             return None
@@ -300,11 +325,12 @@ class QmtService:
         return await self._redis_get_json(KEY_ACCOUNT_ASSET)
 
     async def get_positions(self) -> list[dict]:
-        """读取持仓列表。"""
+        """读取持仓列表。Redis 无数据时从 daily_positions 表兜底。"""
         data = await self._redis_get_json(KEY_ACCOUNT_POSITIONS)
-        if isinstance(data, list):
+        if isinstance(data, list) and data:
             return data
-        return []
+        # fallback: 从 daily_positions 读取最近一个交易日的快照
+        return await self._get_positions_from_db()
 
     async def get_orders(self, cancelable_only: bool = False) -> list[dict]:
         """读取当日委托列表。"""
@@ -322,6 +348,57 @@ class QmtService:
         if isinstance(data, list):
             return data
         return []
+
+    async def _get_positions_from_db(self) -> list[dict]:
+        """从 daily_positions 表读取最近一个交易日的持仓快照，格式兼容 Redis 返回。"""
+        from sqlalchemy import select, func, desc
+        from backend.models.daily_position import DailyPosition
+
+        async with self._db_session_factory() as session:
+            # 取最近的 snapshot_date
+            date_result = await session.execute(
+                select(func.max(DailyPosition.snapshot_date))
+                .where(DailyPosition.account_id == self._config.QMT_ACCOUNT_ID)
+            )
+            latest_date = date_result.scalar()
+            if not latest_date:
+                return []
+
+            result = await session.execute(
+                select(DailyPosition).where(
+                    DailyPosition.snapshot_date == latest_date,
+                    DailyPosition.account_id == self._config.QMT_ACCOUNT_ID,
+                )
+            )
+            positions = result.scalars().all()
+
+        if not positions:
+            return []
+
+        # 获取最新行情用于填充市值/盈亏
+        codes = list({p.stock_code for p in positions})
+        snapshot = await self.get_snapshot(codes)
+
+        out = []
+        for p in positions:
+            tick = snapshot.get(p.stock_code, {})
+            current_price = tick.get("last", float(p.avg_price))
+            market_value = round(current_price * p.volume, 2)
+            profit_loss = round((current_price - float(p.avg_price)) * p.volume, 2)
+            profit_loss_ratio = round(
+                (current_price / float(p.avg_price) - 1) * 100, 2
+            ) if float(p.avg_price) else 0
+            out.append({
+                "stock_code": p.stock_code,
+                "stock_name": p.stock_name or "",
+                "volume": p.volume,
+                "can_use_volume": p.volume,
+                "market_value": market_value,
+                "profit_loss": profit_loss,
+                "profit_loss_ratio": profit_loss_ratio,
+                "open_price": float(p.avg_price),
+            })
+        return out
 
     # ------------------------------------------------------------------
     # MySQL + Redis 写入（交易）
