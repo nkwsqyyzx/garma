@@ -321,8 +321,44 @@ class QmtService:
     # ------------------------------------------------------------------
 
     async def get_asset(self) -> dict | None:
-        """读取账户资金快照。"""
-        return await self._redis_get_json(KEY_ACCOUNT_ASSET)
+        """读取账户资金快照。Redis 无实时数据时从 daily_{date}_account 兜底。"""
+        data = await self._redis_get_json(KEY_ACCOUNT_ASSET)
+        if data is not None:
+            return data
+        return await self._get_asset_from_daily_account()
+
+    async def _get_asset_from_daily_account(self) -> dict | None:
+        """从 daily_{date}_account 列表读取最近一个交易日的资金数据兜底。
+
+        数据格式 (pickle): [timestamp, market_value, cash, total_asset]
+        参见 py_scripts/stock_data/每日总结.py 的 rpush 逻辑。
+        """
+        import asyncio
+        from datetime import timedelta
+
+        today = date.today()
+        for i in range(7):
+            d = today - timedelta(days=i)
+            key = f"daily_{d.strftime('%Y%m%d')}_account"
+            try:
+                # 使用 _tick_redis（decode_responses=False）以正确读取 pickle 二进制数据
+                raw_list = await asyncio.to_thread(self._tick_redis.lrange, key, -1, -1)
+                if not raw_list:
+                    continue
+                values = pickle.loads(raw_list[-1])
+                # values: [timestamp, market_value, cash, total_asset]
+                return {
+                    "total_asset": float(values[3]),
+                    "cash": float(values[2]),
+                    "market_value": float(values[1]),
+                    "frozen_cash": 0,
+                    "updated_at": float(values[0]),
+                    "updated_by": f"daily_account_fallback_{d}",
+                }
+            except Exception:
+                logger.debug(f"读取 {key} 失败，尝试前一日")
+                continue
+        return None
 
     async def get_positions(self) -> list[dict]:
         """读取持仓列表。Redis 无数据时从 daily_positions 表兜底。"""
@@ -1163,6 +1199,7 @@ class QmtService:
                 "strategy": r.strategy or "",
                 "factor": r.factor or "",
                 "trade_date": str(r.trade_date),
+                "order_req_id": r.order_req_id or "",
                 "pct_change": 0,
                 "pnl": 0,
             }
