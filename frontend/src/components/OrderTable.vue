@@ -20,7 +20,7 @@
         </template>
       </el-table-column>
       <el-table-column label="价格" width="90" align="right">
-        <template #default="{ row }">{{ row.price?.toFixed(2) }}</template>
+        <template #default="{ row }">{{ formatPrice(row.stock_code, row.price) }}</template>
       </el-table-column>
       <el-table-column prop="order_volume" label="委托量" width="90" align="right" />
       <el-table-column prop="traded_volume" label="已成交" width="90" align="right" />
@@ -58,7 +58,7 @@
         </div>
         <div class="card-info">
           <span>{{ formatTime(order.order_time) }}</span>
-          <span>{{ order.price?.toFixed(2) }} x {{ order.order_volume }}</span>
+          <span>{{ formatPrice(order.stock_code, order.price) }} x {{ order.order_volume }}</span>
           <span>成交 {{ order.traded_volume }}</span>
           <el-button v-if="isCancelable(resolveStatus(order))" type="warning" size="small" text @click="onCancel(order)">撤单</el-button>
         </div>
@@ -75,7 +75,7 @@ import { storeToRefs } from 'pinia'
 import { useAccountStore } from '@/stores/account'
 import { useBreakpoint } from '@/composables/useBreakpoint'
 import { cancelOrder, cancelAll } from '@/api/qmt'
-import { formatTime } from '@/utils/format'
+import { formatTime, formatPrice } from '@/utils/format'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 const account = useAccountStore()
@@ -98,10 +98,16 @@ function resolveStatus(order: any): string {
   const map: Record<string, string> = {
     CANCELING: 'cancelled',
     CANCELLED: 'cancelled',
-    UNKNOWN: 'submitted',
+    // UNKNOWN + 0成交：券商侧已处理完毕但 xtquant 未回调终态（如手工撤单），视为已撤
+    // UNKNOWN + 有成交：走上方的 partial/filled 分支
+    UNKNOWN: 'cancelled',
     PENDING: 'submitted',
-    FILED: 'filled',
+    SUBMITTED: 'submitted',
+    PARTIALLY_FILLED: 'partial',
+    FILLED: 'filled',
     REJECTED: 'rejected',
+    CANCEL_FAILED: 'submitted',
+    PARTIALLY_CANCELLED: 'cancelled',
   }
   return map[s] || s
 }

@@ -21,7 +21,7 @@
         </template>
       </el-table-column>
       <el-table-column label="价格" width="90" align="right">
-        <template #default="{ row }">{{ row.traded_price?.toFixed(2) }}</template>
+        <template #default="{ row }">{{ formatPrice(row.stock_code, row.traded_price) }}</template>
       </el-table-column>
       <el-table-column prop="traded_volume" label="成交量" width="90" align="right" />
       <el-table-column label="成交额" width="120" align="right">
@@ -44,7 +44,7 @@
           </div>
         </div>
         <div class="card-info">
-          <span>{{ trade.traded_price?.toFixed(2) }} x {{ trade.traded_volume }}</span>
+          <span>{{ formatPrice(trade.stock_code, trade.traded_price) }} x {{ trade.traded_volume }}</span>
           <span>{{ formatMoney(trade.traded_amount) }}</span>
         </div>
       </el-card>
@@ -59,7 +59,7 @@ import { storeToRefs } from 'pinia'
 import { useAccountStore } from '@/stores/account'
 import { useBreakpoint } from '@/composables/useBreakpoint'
 import { getStockNames } from '@/api/qmt'
-import { formatMoney, formatTime } from '@/utils/format'
+import { formatMoney, formatTime, formatPrice } from '@/utils/format'
 import { onMounted } from 'vue'
 
 const account = useAccountStore()

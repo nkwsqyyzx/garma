@@ -27,7 +27,7 @@
         </template>
       </el-table-column>
       <el-table-column prop="open_price" label="成本价" width="90" align="right" sortable>
-        <template #default="{ row }">{{ row.open_price?.toFixed(2) }}</template>
+        <template #default="{ row }">{{ formatPrice(row.stock_code, row.open_price) }}</template>
       </el-table-column>
     </el-table>
 
@@ -65,7 +65,7 @@ import { useAccountStore } from '@/stores/account'
 import { useBreakpoint } from '@/composables/useBreakpoint'
 import { useRouter } from 'vue-router'
 import { getStockNames } from '@/api/qmt'
-import { formatMoney, formatPct, pnlClass } from '@/utils/format'
+import { formatMoney, formatPct, pnlClass, formatPrice } from '@/utils/format'
 import { watch, computed } from 'vue'
 
 const router = useRouter()

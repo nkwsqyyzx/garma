@@ -69,7 +69,7 @@
             <template #default="{ row }">{{ formatMoney(row.cost) }}</template>
           </el-table-column>
           <el-table-column prop="avg_price" label="均价" width="90" align="right">
-            <template #default="{ row }">{{ row.avg_price.toFixed(2) }}</template>
+            <template #default="{ row }">{{ formatPrice(row.stock_code, row.avg_price) }}</template>
           </el-table-column>
           <el-table-column prop="pct_change" label="涨跌幅" width="100" align="right">
             <template #default="{ row }">
@@ -153,7 +153,7 @@
 import { computed, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useBreakpoint } from '@/composables/useBreakpoint'
-import { formatMoney, formatPct, pnlClass } from '@/utils/format'
+import { formatMoney, formatPct, pnlClass, formatPrice } from '@/utils/format'
 import { placeOrder } from '@/api/qmt'
 import type { FactorGroup, PositionRow } from '@/views/StrategyPositions.vue'
 
