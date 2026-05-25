@@ -23,14 +23,11 @@ export default defineConfig({
     outDir: '../backend/static',
     emptyOutDir: true,
     rollupOptions: {
-      external: ['echarts'],
       output: {
-        globals: {
-          echarts: 'echarts',
-        },
         manualChunks: {
           'element-plus': ['element-plus'],
           'vue-vendor': ['vue', 'vue-router', 'pinia'],
+          'echarts': ['echarts', 'vue-echarts'],
         },
       },
     },

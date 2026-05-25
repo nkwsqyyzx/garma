@@ -3,6 +3,7 @@
     <StrategyPositionTable
       v-if="groupedData.length"
       :factors="groupedData"
+      :cash="availableCash"
       @row-click="onRowClick"
     />
     <div v-else-if="!loading" class="empty-text">暂无策略持仓数据</div>
@@ -13,7 +14,7 @@
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import StrategyPositionTable from '@/components/StrategyPositionTable.vue'
-import { getStrategyPositions, type StrategyPosition } from '@/api/qmt'
+import { getStrategyPositions, getAsset, type StrategyPosition } from '@/api/qmt'
 
 const router = useRouter()
 const loading = ref(false)
@@ -51,6 +52,7 @@ export interface FactorGroup {
 }
 
 const groupedData = ref<FactorGroup[]>([])
+const availableCash = ref(0)
 
 function parseOther(other: string): { strategy: string; factor: string; rank: number; stock_name: string } {
   const parts = other.split(':')
@@ -138,8 +140,12 @@ function groupByFactorAndStrategy(raw: StrategyPosition[]): FactorGroup[] {
 async function loadData() {
   loading.value = true
   try {
-    const data = await getStrategyPositions()
+    const [data, asset] = await Promise.all([
+      getStrategyPositions(),
+      getAsset().catch(() => null),
+    ])
     groupedData.value = groupByFactorAndStrategy(data || [])
+    availableCash.value = asset?.cash ?? 0
   } catch {
     groupedData.value = []
   } finally {
@@ -156,8 +162,6 @@ onMounted(() => loadData())
 
 <style scoped>
 .strategy-positions {
-  max-width: 1200px;
-  margin: 0 auto;
   min-height: 200px;
 }
 .empty-text { text-align: center; color: #c0c4cc; padding: 32px 0; }
