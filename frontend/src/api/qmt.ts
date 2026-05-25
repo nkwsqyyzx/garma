@@ -71,6 +71,8 @@ export async function placeOrder(params: {
   strategy_name?: string
   order_remark?: string
   linked_req_id?: string
+  linked_batch_id?: string
+  batch_id?: string
 }) {
   return request<{ req_id: string }>('/trade/order', {
     method: 'POST',
@@ -104,6 +106,7 @@ export interface StrategyPosition {
   current_price: number
   pnl: number
   order_req_id: string
+  batch_id: string
 }
 
 export async function getStrategyPositions() {

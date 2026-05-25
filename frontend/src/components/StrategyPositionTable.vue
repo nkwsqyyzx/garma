@@ -243,7 +243,8 @@ async function onSellSubmit() {
       order_volume: sellForm.value.volume,
       price_type: 'limit',
       price: sellForm.value.price,
-      linked_req_id: target.order_req_id,
+      linked_batch_id: target.batch_id || undefined,
+      linked_req_id: target.batch_id ? undefined : target.order_req_id,
     })
     ElMessage.success(`卖出委托已提交: ${result.req_id}`)
     sellDialogVisible.value = false

@@ -58,13 +58,6 @@ class QmtOrderWorker:
     async def _run(self) -> None:
         await asyncio.to_thread(self._ensure_group)
         while self._running:
-            # 非交易时间挂起
-            if not is_trading_hours():
-                wait = seconds_until_trading_start()
-                logger.debug("OrderWorker: outside trading hours, sleeping {:.0f}s", wait)
-                await asyncio.sleep(min(wait, 60))
-                continue
-
             try:
                 # XREADGROUP 阻塞 2000ms（低于 socket_timeout=3s，避免超时）
                 results = await asyncio.to_thread(
@@ -76,22 +69,23 @@ class QmtOrderWorker:
                     block=2000,
                 )
                 if not results:
-                    # 无事件时，每 5 个周期（~10s）做一次成交对账
-                    self._reconcile_counter += 1
-                    if self._reconcile_counter >= 5 and self._service:
-                        self._reconcile_counter = 0
-                        try:
-                            await self._service.reconcile_strategy_trades()
-                        except Exception:
-                            logger.exception("Strategy trade reconciliation failed")
+                    # 无事件时，每 5 个周期（~10s）做一次成交对账（仅交易时间）
+                    if is_trading_hours():
+                        self._reconcile_counter += 1
+                        if self._reconcile_counter >= 5 and self._service:
+                            self._reconcile_counter = 0
+                            try:
+                                await self._service.reconcile_strategy_trades()
+                            except Exception:
+                                logger.exception("Strategy trade reconciliation failed")
                     continue
 
                 for stream_name, messages in results:
                     for msg_id, fields in messages:
                         await self._handle_message(msg_id, fields)
 
-                # 处理完事件后也做一次对账
-                if self._service:
+                # 处理完事件后也做一次对账（仅交易时间）
+                if is_trading_hours() and self._service:
                     try:
                         await self._service.reconcile_strategy_trades()
                     except Exception:

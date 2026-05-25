@@ -30,6 +30,7 @@ export interface PositionRow {
   pnl: number
   rank: number
   order_req_id: string
+  batch_id: string
 }
 
 export interface StrategyGroup {
@@ -101,6 +102,7 @@ function groupByFactorAndStrategy(raw: StrategyPosition[]): FactorGroup[] {
       pnl: item.pnl,
       rank,
       order_req_id: item.order_req_id,
+      batch_id: item.batch_id,
     })
   }
 

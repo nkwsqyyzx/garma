@@ -130,6 +130,12 @@ class CmdConsumer:
                 if order_id is not None:
                     # 下单成功
                     self._redis.ack_cmd(cmd_raw)
+                    # 存储 local_order_id → req_id 映射，供 callback 反查
+                    self._redis.raw.setex(
+                        f"qmt:order:req_by_local:{order_id}",
+                        86400,
+                        req_id,
+                    )
                     # 写入初始状态到 Redis
                     event = {
                         "event_type": "order_submitted",
@@ -146,7 +152,20 @@ class CmdConsumer:
                     self._redis.set_order_status(req_id, event)
                     self._redis.publish_order_event(event)
                 else:
-                    # 下单失败
+                    # 下单失败：发布 REJECTED 事件通知 backend 更新 qmt_orders 状态
+                    reject_event = {
+                        "event_type": "order_error",
+                        "req_id": req_id,
+                        "account_id": cmd.get("account_id", ""),
+                        "stock_code": cmd.get("stock_code", ""),
+                        "order_type": cmd.get("order_type", ""),
+                        "order_volume": cmd.get("order_volume", 0),
+                        "price": cmd.get("price", 0),
+                        "status": "REJECTED",
+                        "error_msg": "xttrader.order_stock_async 同步拒绝",
+                        "timestamp": time.time(),
+                    }
+                    self._redis.publish_order_event(reject_event)
                     self._redis.nack_cmd(cmd, cmd_raw, "xttrader.order_stock_async 返回失败")
 
             elif cmd_type == "cancel_order":
@@ -179,6 +198,21 @@ class CmdConsumer:
 
         except Exception as e:
             logger.error("[ERROR] 命令处理异常 req_id=%s", req_id, exc_info=True)
+            # 发布 REJECTED 事件，避免 qmt_orders 状态卡在 DRAFT
+            if cmd_type == "place_order":
+                reject_event = {
+                    "event_type": "order_error",
+                    "req_id": req_id,
+                    "account_id": cmd.get("account_id", ""),
+                    "stock_code": cmd.get("stock_code", ""),
+                    "order_type": cmd.get("order_type", ""),
+                    "order_volume": cmd.get("order_volume", 0),
+                    "price": cmd.get("price", 0),
+                    "status": "REJECTED",
+                    "error_msg": str(e),
+                    "timestamp": time.time(),
+                }
+                self._redis.publish_order_event(reject_event)
             self._redis.nack_cmd(cmd, cmd_raw, str(e))
 
     def _cancel_all_orders(self, cmd: dict) -> None:

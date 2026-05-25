@@ -291,7 +291,7 @@ class AccountHub:
             )
             now = time.time()
             last = self._last_sync_log_at.get(account_id, 0)
-            if now - last >= 30:
+            if now - last >= 300:
                 logger.info("[OK] AccountHub 全量同步完成 account=%s", account_id)
                 self._last_sync_log_at[account_id] = now
         except Exception:

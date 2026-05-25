@@ -145,7 +145,10 @@ async def trade_order(
     # 检查熔断
     if await svc.get_kill_switch():
         raise HTTPException(status_code=403, detail="Kill switch is active, trading disabled")
-    req_id = await svc.place_order(request)
+    try:
+        req_id = await svc.place_order(request)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return _api_ok(QmtOrderResponse(req_id=req_id).model_dump())
 
 

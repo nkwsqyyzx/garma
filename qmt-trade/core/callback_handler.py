@@ -203,6 +203,16 @@ class CallbackHandler(XtQuantTraderCallback):
         """触发时机：委托被交易所/柜台拒绝"""
         try:
             req_id = self._parse_req_id(getattr(order_error, "order_remark", ""))
+            # 兜底1：从内存委托快照中通过 order_id 反查 req_id
+            if not req_id:
+                req_id = self._hub.get_req_id_by_order_id(
+                    order_error.account_id, str(order_error.order_id)
+                )
+            # 兜底2：从 Redis 映射 local_order_id → req_id（cmd_consumer 写入）
+            if not req_id:
+                cached = self._redis.raw.get(f"qmt:order:req_by_local:{order_error.order_id}")
+                if cached:
+                    req_id = cached if isinstance(cached, str) else cached.decode()
 
             event = {
                 "event_type": "order_error",

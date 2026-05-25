@@ -441,67 +441,209 @@ class QmtService:
     # ------------------------------------------------------------------
 
     async def place_order(self, request) -> str:
-        """下单：1) INSERT qmt_orders DRAFT  2) RPUSH 命令队列。"""
+        """下单：1) INSERT qmt_orders DRAFT  2) RPUSH 命令队列。
+
+        卖出时使用 SELECT FOR UPDATE 行级锁 + 事务内校验，
+        防止并发卖出超出可用持仓。
+        """
         req_id = f"alpha_{uuid.uuid4().hex[:16]}_{int(time.time())}"
 
-        # 卖出且带有 linked_req_id 时，从 strategy_trades 继承策略信息
+        # 卖出时，从 strategy_trades 继承策略信息
+        # 优先用 linked_batch_id 查找（覆盖拆单批次），否则用 linked_req_id
         strategy_name = request.strategy_name
         order_remark = request.order_remark
         stock_name = None
 
-        if (not strategy_name or not order_remark) and request.linked_req_id:
+        # batch_id: 直接传入，或卖出时从 linked_batch_id 继承
+        effective_batch_id = request.batch_id
+        if not effective_batch_id and request.order_type == "sell":
+            effective_batch_id = request.linked_batch_id
+
+        if request.order_type == "sell":
+            # ── 卖出路径：单一事务内完成 策略继承 + 持仓校验 + 下单 ──
             async with self._db_session_factory() as session:
-                result = await session.execute(
-                    select(
-                        StrategyTrade.strategy,
-                        StrategyTrade.factor,
-                        StrategyTrade.remark,
-                        StrategyTrade.stock_name,
+                # 1) FOR UPDATE 锁住该标的所有 strategy_trades 行，
+                #    阻止并发卖出事务读取过期的持仓数据
+                await session.execute(
+                    select(StrategyTrade.id)
+                    .where(
+                        StrategyTrade.stock_code == request.stock_code,
+                        StrategyTrade.account_id == self._config.QMT_ACCOUNT_ID,
                     )
-                    .where(StrategyTrade.order_req_id == request.linked_req_id)
-                    .limit(1)
+                    .with_for_update()
                 )
-                row = result.first()
-                if row:
-                    if not strategy_name and row[0]:
-                        strategy_name = row[0]
-                    if row[1] or row[2]:
-                        # 从继承的策略信息重建 order_remark
-                        factor = row[1] or "-"
-                        remark_base = row[2] or ""
-                        if not order_remark:
-                            # 尝试从 remark 中提取名称部分
-                            name = request.stock_code
-                            if remark_base and ":" in remark_base:
-                                parts = remark_base.split(":")
-                                if len(parts) >= 4:
-                                    name = parts[3]
-                            order_remark = f"{strategy_name or '-'}:{factor}:0:{name}"
-                    if row[3]:
-                        stock_name = row[3]
 
-        # stock_name 兜底：从 Redis 缓存获取
-        if not stock_name:
-            names = await self.get_stock_names([request.stock_code])
-            stock_name = names.get(request.stock_code) or None
+                # 2) 继承策略元数据
+                if (not strategy_name or not order_remark) and (request.linked_batch_id or request.linked_req_id):
+                    if request.linked_batch_id:
+                        meta_result = await session.execute(
+                            select(
+                                StrategyTrade.strategy,
+                                StrategyTrade.factor,
+                                StrategyTrade.remark,
+                                StrategyTrade.stock_name,
+                            )
+                            .where(StrategyTrade.batch_id == request.linked_batch_id)
+                            .limit(1)
+                        )
+                    else:
+                        meta_result = await session.execute(
+                            select(
+                                StrategyTrade.strategy,
+                                StrategyTrade.factor,
+                                StrategyTrade.remark,
+                                StrategyTrade.stock_name,
+                            )
+                            .where(StrategyTrade.order_req_id == request.linked_req_id)
+                            .limit(1)
+                        )
+                    row = meta_result.first()
+                    if row:
+                        if not strategy_name and row[0]:
+                            strategy_name = row[0]
+                        if row[1] or row[2]:
+                            factor = row[1] or "-"
+                            remark_base = row[2] or ""
+                            if not order_remark:
+                                name = request.stock_code
+                                if remark_base and ":" in remark_base:
+                                    parts = remark_base.split(":")
+                                    if len(parts) >= 4:
+                                        name = parts[3]
+                                order_remark = f"{strategy_name or '-'}:{factor}:0:{name}"
+                        if row[3]:
+                            stock_name = row[3]
 
-        async with self._db_session_factory() as session:
-            order = QmtOrder(
-                req_id=req_id,
-                account_id=self._config.QMT_ACCOUNT_ID,
-                stock_code=request.stock_code,
-                stock_name=stock_name,
-                order_type=request.order_type,
-                order_volume=request.order_volume,
-                price_type=request.price_type,
-                price=request.price,
-                strategy_name=strategy_name,
-                order_remark=order_remark,
-                linked_req_id=request.linked_req_id,
-                status="DRAFT",
-            )
-            session.add(order)
-            await session.commit()
+                # 3) 计算净持仓 (strategy_trades 中买卖抵消)
+                from sqlalchemy import func as _func, case as _case
+                net_result = await session.execute(
+                    select(
+                        _func.sum(
+                            _case(
+                                (StrategyTrade.direction == "buy", StrategyTrade.volume),
+                                else_=-StrategyTrade.volume,
+                            )
+                        )
+                    )
+                    .where(
+                        StrategyTrade.stock_code == request.stock_code,
+                        StrategyTrade.account_id == self._config.QMT_ACCOUNT_ID,
+                    )
+                )
+                net_position = int(net_result.scalar() or 0)
+
+                # 4) 计算挂起的未成交卖出量 (qmt_orders 中非终态卖单)
+                NON_TERMINAL = ("DRAFT", "PENDING", "SUBMITTED", "PARTIALLY_FILLED")
+                pending_result = await session.execute(
+                    select(
+                        _func.sum(
+                            QmtOrder.order_volume - _func.coalesce(QmtOrder.traded_volume, 0)
+                        )
+                    )
+                    .where(
+                        QmtOrder.stock_code == request.stock_code,
+                        QmtOrder.order_type == "sell",
+                        QmtOrder.account_id == self._config.QMT_ACCOUNT_ID,
+                        QmtOrder.status.in_(NON_TERMINAL),
+                    )
+                )
+                pending_sell = int(pending_result.scalar() or 0)
+
+                available = net_position - pending_sell
+                if request.order_volume > available:
+                    raise ValueError(
+                        f"卖出量 {request.order_volume} 超过可用持仓 "
+                        f"(净持仓={net_position}, 挂单占用={pending_sell}, 可用={available})"
+                    )
+
+                # 5) stock_name 兜底
+                if not stock_name:
+                    names = await self.get_stock_names([request.stock_code])
+                    stock_name = names.get(request.stock_code) or None
+
+                # 6) 插入订单
+                order = QmtOrder(
+                    req_id=req_id,
+                    account_id=self._config.QMT_ACCOUNT_ID,
+                    stock_code=request.stock_code,
+                    stock_name=stock_name,
+                    order_type=request.order_type,
+                    order_volume=request.order_volume,
+                    price_type=request.price_type,
+                    price=request.price,
+                    strategy_name=strategy_name,
+                    order_remark=order_remark,
+                    linked_req_id=request.linked_req_id,
+                    batch_id=effective_batch_id,
+                    status="DRAFT",
+                )
+                session.add(order)
+                await session.commit()
+        else:
+            # ── 买入路径：无需持仓校验 ──
+            if (not strategy_name or not order_remark) and (request.linked_batch_id or request.linked_req_id):
+                async with self._db_session_factory() as session:
+                    if request.linked_batch_id:
+                        meta_result = await session.execute(
+                            select(
+                                StrategyTrade.strategy,
+                                StrategyTrade.factor,
+                                StrategyTrade.remark,
+                                StrategyTrade.stock_name,
+                            )
+                            .where(StrategyTrade.batch_id == request.linked_batch_id)
+                            .limit(1)
+                        )
+                    else:
+                        meta_result = await session.execute(
+                            select(
+                                StrategyTrade.strategy,
+                                StrategyTrade.factor,
+                                StrategyTrade.remark,
+                                StrategyTrade.stock_name,
+                            )
+                            .where(StrategyTrade.order_req_id == request.linked_req_id)
+                            .limit(1)
+                        )
+                    row = meta_result.first()
+                    if row:
+                        if not strategy_name and row[0]:
+                            strategy_name = row[0]
+                        if row[1] or row[2]:
+                            factor = row[1] or "-"
+                            remark_base = row[2] or ""
+                            if not order_remark:
+                                name = request.stock_code
+                                if remark_base and ":" in remark_base:
+                                    parts = remark_base.split(":")
+                                    if len(parts) >= 4:
+                                        name = parts[3]
+                                order_remark = f"{strategy_name or '-'}:{factor}:0:{name}"
+                        if row[3]:
+                            stock_name = row[3]
+
+            if not stock_name:
+                names = await self.get_stock_names([request.stock_code])
+                stock_name = names.get(request.stock_code) or None
+
+            async with self._db_session_factory() as session:
+                order = QmtOrder(
+                    req_id=req_id,
+                    account_id=self._config.QMT_ACCOUNT_ID,
+                    stock_code=request.stock_code,
+                    stock_name=stock_name,
+                    order_type=request.order_type,
+                    order_volume=request.order_volume,
+                    price_type=request.price_type,
+                    price=request.price,
+                    strategy_name=strategy_name,
+                    order_remark=order_remark,
+                    linked_req_id=request.linked_req_id,
+                    batch_id=effective_batch_id,
+                    status="DRAFT",
+                )
+                session.add(order)
+                await session.commit()
 
         cmd = {
             "req_id": req_id,
@@ -515,6 +657,7 @@ class QmtService:
             "strategy_name": request.strategy_name or "",
             "order_remark": request.order_remark or "",
             "linked_req_id": request.linked_req_id or "",
+            "batch_id": request.batch_id or "",
             "retry_count": 0,
             "created_at": time.time(),
         }
@@ -793,6 +936,7 @@ class QmtService:
                 source="order",
                 order_req_id=req_id,
                 linked_req_id=getattr(order, "linked_req_id", None),
+                batch_id=getattr(order, "batch_id", None),
             )
             session.add(trade)
             await session.commit()
@@ -1045,9 +1189,23 @@ class QmtService:
     # ------------------------------------------------------------------
 
     async def get_strategy_positions(self) -> list[dict]:
-        """从 strategy_trades 流水表聚合当前持仓，补充实时行情。"""
+        """从 strategy_trades 流水表聚合当前持仓，补充实时行情。
+
+        聚合粒度: (stock_code, strategy, factor, position_key)
+        - position_key = COALESCE(batch_id, linked_req_id, order_req_id)
+          使得拆单批次(batch_id)合为一行，卖出通过 linked_req_id 与买入归入同一组
+        """
         from sqlalchemy import func, case
         from backend.utils.adjustment import get_adjustment_factors, calc_adjusted_return
+
+        # position_key: 卖出用 linked_req_id 归入买入所在的组
+        position_key = func.coalesce(
+            StrategyTrade.batch_id,
+            case(
+                (StrategyTrade.direction == "sell", StrategyTrade.linked_req_id),
+                else_=StrategyTrade.order_req_id,
+            ),
+        ).label("position_key")
 
         async with self._db_session_factory() as session:
             stmt = (
@@ -1055,9 +1213,16 @@ class QmtService:
                     StrategyTrade.stock_code,
                     StrategyTrade.strategy,
                     StrategyTrade.factor,
+                    position_key,
                     func.min(StrategyTrade.remark).label("remark"),
                     func.min(StrategyTrade.trade_date).label("trade_date"),
-                    func.min(StrategyTrade.order_req_id).label("order_req_id"),
+                    func.min(
+                        case(
+                            (StrategyTrade.direction == "buy", StrategyTrade.order_req_id),
+                            else_=None,
+                        )
+                    ).label("order_req_id"),
+                    func.min(StrategyTrade.batch_id).label("batch_id"),
                     func.sum(
                         case(
                             (StrategyTrade.direction == "buy", StrategyTrade.volume),
@@ -1076,6 +1241,7 @@ class QmtService:
                     StrategyTrade.stock_code,
                     StrategyTrade.strategy,
                     StrategyTrade.factor,
+                    text("position_key"),
                 )
                 .having(text("holding_volume > 0"))
             )
@@ -1117,6 +1283,7 @@ class QmtService:
                 "current_price": current_price,
                 "pnl": pnl,
                 "order_req_id": r.order_req_id or "",
+                "batch_id": r.batch_id or "",
             })
         return results
 

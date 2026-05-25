@@ -28,10 +28,12 @@ class StrategyTrade(Base):
     source: Mapped[str] = mapped_column(String(20), nullable=False, server_default="order", comment="来源: order/import/manual")
     order_req_id: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="关联 qmt_orders.req_id")
     linked_req_id: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="卖出时关联的买入order_req_id")
+    batch_id: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="拆单批次ID, 同一批拆单共享")
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP"), comment="创建时间")
 
     __table_args__ = (
         Index("idx_account_date", "account_id", "trade_date"),
         Index("idx_stock_date", "stock_code", "trade_date"),
         Index("idx_order_req_id", "order_req_id"),
+        Index("idx_batch_id", "batch_id"),
     )
