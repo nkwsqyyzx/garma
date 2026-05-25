@@ -21,6 +21,7 @@ from backend.service.qmt_service import QmtService
 from backend.worker.qmt_order_worker import QmtOrderWorker
 from backend.worker.qmt_status_worker import QmtStatusWorker
 from backend.worker.qmt_data_push_worker import QmtDataPushWorker
+from backend.worker.asset_snapshot_worker import AssetSnapshotWorker
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +118,9 @@ async def lifespan(app: FastAPI):
     )
     worker_tasks.extend(data_push_worker.start())
     app.state.data_push_worker = data_push_worker
+
+    asset_snapshot_worker = AssetSnapshotWorker(qmt_service=qmt_service)
+    worker_tasks.append(asset_snapshot_worker.start())
 
     logger.info("All workers started ({} tasks)", len(worker_tasks))
 

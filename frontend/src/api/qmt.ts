@@ -133,3 +133,81 @@ export async function getStrategyTrades(tradeDate?: string) {
   const params = tradeDate ? `?trade_date=${tradeDate}` : ''
   return request<StrategyTrade[]>(`/strategy/trades${params}`)
 }
+
+// ── 银证转账 ─────────────────────────────────────────
+
+export interface FundTransfer {
+  id: number
+  account_id: string
+  trade_date: string
+  direction: string
+  amount: number
+  note: string | null
+  created_at: string
+  updated_at: string
+}
+
+export async function getFundTransfers(startDate?: string, endDate?: string) {
+  const params = new URLSearchParams()
+  if (startDate) params.set('start_date', startDate)
+  if (endDate) params.set('end_date', endDate)
+  const qs = params.toString()
+  return request<FundTransfer[]>(`/fund-transfers${qs ? '?' + qs : ''}`)
+}
+
+export async function createFundTransfer(data: {
+  trade_date: string
+  direction: string
+  amount: number
+  note?: string
+}) {
+  return request<FundTransfer>('/fund-transfers', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function deleteFundTransfer(id: number) {
+  return request<null>(`/fund-transfers/${id}`, {
+    method: 'DELETE',
+  })
+}
+
+// ── 资产快照 & 每日盈亏 ──────────────────────────────
+
+export interface AssetSnapshot {
+  id: number
+  account_id: string
+  trade_date: string
+  snapshot_type: string
+  total_asset: number
+  cash: number
+  frozen_cash: number
+  market_value: number
+  created_at: string
+}
+
+export async function getAssetSnapshots(startDate?: string, endDate?: string) {
+  const params = new URLSearchParams()
+  if (startDate) params.set('start_date', startDate)
+  if (endDate) params.set('end_date', endDate)
+  const qs = params.toString()
+  return request<AssetSnapshot[]>(`/asset-snapshots${qs ? '?' + qs : ''}`)
+}
+
+export interface DailyPnl {
+  trade_date: string
+  pre_asset: number | null
+  post_asset: number | null
+  daily_pnl: number | null
+  net_transfer: number
+  adjusted_pnl: number | null
+}
+
+export async function getDailyPnl(startDate?: string, endDate?: string) {
+  const params = new URLSearchParams()
+  if (startDate) params.set('start_date', startDate)
+  if (endDate) params.set('end_date', endDate)
+  const qs = params.toString()
+  return request<DailyPnl[]>(`/daily-pnl${qs ? '?' + qs : ''}`)
+}

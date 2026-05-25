@@ -85,3 +85,27 @@ class QmtConfigUpdateRequest(BaseModel):
 
 class KillSwitchResponse(BaseModel):
     active: bool = Field(..., description="熔断是否激活")
+
+
+# ---------------------------------------------------------------------------
+# 银证转账
+# ---------------------------------------------------------------------------
+
+class FundTransferCreate(BaseModel):
+    trade_date: str = Field(..., description="交易日期，如 2026-05-25")
+    direction: str = Field(..., description="deposit / withdraw")
+    amount: float = Field(..., gt=0, description="金额")
+    note: str | None = Field(default=None, description="备注")
+
+
+# ---------------------------------------------------------------------------
+# 每日盈亏
+# ---------------------------------------------------------------------------
+
+class DailyPnlResponse(BaseModel):
+    trade_date: str = Field(..., description="交易日期")
+    pre_asset: float | None = Field(default=None, description="盘前总资产")
+    post_asset: float | None = Field(default=None, description="盘后总资产")
+    daily_pnl: float | None = Field(default=None, description="当日盈亏")
+    net_transfer: float = Field(default=0, description="净转账（入金为正）")
+    adjusted_pnl: float | None = Field(default=None, description="调整后盈亏")

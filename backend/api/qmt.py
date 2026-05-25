@@ -14,6 +14,7 @@ from backend.schemas.qmt import (
     QmtConfigResponse,
     QmtConfigUpdateRequest,
     KillSwitchResponse,
+    FundTransferCreate,
 )
 from backend.service.qmt_service import QmtService
 
@@ -290,3 +291,73 @@ async def update_config(
     # 配置通过环境变量 / .env 管理，运行时不支持热更新核心配置
     # 此接口用于前端展示，实际修改需要更新 .env 文件并重启服务
     return _api_error(1001, "Config update requires .env file modification and service restart")
+
+
+# ===========================================================================
+# 银证转账（3 个）
+# ===========================================================================
+
+@router.get("/fund-transfers")
+async def list_fund_transfers(
+    start_date: date | None = Query(None, description="开始日期"),
+    end_date: date | None = Query(None, description="结束日期"),
+    svc: QmtService = Depends(get_qmt_service),
+):
+    """查询银证转账记录。"""
+    data = await svc.list_fund_transfers(start_date=start_date, end_date=end_date)
+    return _api_ok(data)
+
+
+@router.post("/fund-transfers")
+async def create_fund_transfer(
+    request: FundTransferCreate,
+    svc: QmtService = Depends(get_qmt_service),
+):
+    """新增银证转账记录。"""
+    if request.direction not in ("deposit", "withdraw"):
+        return _api_error(1001, "direction must be deposit or withdraw")
+    data = await svc.create_fund_transfer(
+        trade_date=request.trade_date,
+        direction=request.direction,
+        amount=request.amount,
+        note=request.note,
+    )
+    return _api_ok(data)
+
+
+@router.delete("/fund-transfers/{transfer_id}")
+async def delete_fund_transfer(
+    transfer_id: int,
+    svc: QmtService = Depends(get_qmt_service),
+):
+    """删除银证转账记录。"""
+    ok = await svc.delete_fund_transfer(transfer_id)
+    if not ok:
+        return _api_error(1001, "Transfer record not found")
+    return _api_ok(None)
+
+
+# ===========================================================================
+# 资产快照 & 每日盈亏（2 个）
+# ===========================================================================
+
+@router.get("/asset-snapshots")
+async def list_asset_snapshots(
+    start_date: date | None = Query(None, description="开始日期"),
+    end_date: date | None = Query(None, description="结束日期"),
+    svc: QmtService = Depends(get_qmt_service),
+):
+    """查询资产快照历史。"""
+    data = await svc.list_asset_snapshots(start_date=start_date, end_date=end_date)
+    return _api_ok(data)
+
+
+@router.get("/daily-pnl")
+async def daily_pnl(
+    start_date: date | None = Query(None, description="开始日期"),
+    end_date: date | None = Query(None, description="结束日期"),
+    svc: QmtService = Depends(get_qmt_service),
+):
+    """每日盈亏汇总。"""
+    data = await svc.get_daily_pnl_summary(start_date=start_date, end_date=end_date)
+    return _api_ok(data)

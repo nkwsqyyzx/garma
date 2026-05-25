@@ -1408,6 +1408,185 @@ class QmtService:
         return results
 
     # ------------------------------------------------------------------
+    # 银证转账 & 资产快照
+    # ------------------------------------------------------------------
+
+    async def list_fund_transfers(self, start_date: date | None = None, end_date: date | None = None) -> list[dict]:
+        """查询银证转账记录。"""
+        from backend.models.fund_transfer import FundTransfer
+        async with self._db_session_factory() as session:
+            stmt = select(FundTransfer).order_by(FundTransfer.trade_date.desc(), FundTransfer.id.desc())
+            if start_date:
+                stmt = stmt.where(FundTransfer.trade_date >= start_date)
+            if end_date:
+                stmt = stmt.where(FundTransfer.trade_date <= end_date)
+            result = await session.execute(stmt)
+            rows = result.scalars().all()
+            return [
+                {
+                    "id": r.id,
+                    "account_id": r.account_id,
+                    "trade_date": str(r.trade_date),
+                    "direction": r.direction,
+                    "amount": float(r.amount),
+                    "note": r.note,
+                    "created_at": str(r.created_at),
+                    "updated_at": str(r.updated_at),
+                }
+                for r in rows
+            ]
+
+    async def create_fund_transfer(self, trade_date: str, direction: str, amount: float, note: str | None = None) -> dict:
+        """创建银证转账记录。"""
+        from backend.models.fund_transfer import FundTransfer
+        async with self._db_session_factory() as session:
+            transfer = FundTransfer(
+                account_id=self._config.QMT_ACCOUNT_ID,
+                trade_date=date.fromisoformat(trade_date),
+                direction=direction,
+                amount=amount,
+                note=note,
+            )
+            session.add(transfer)
+            await session.commit()
+            await session.refresh(transfer)
+            return {
+                "id": transfer.id,
+                "account_id": transfer.account_id,
+                "trade_date": str(transfer.trade_date),
+                "direction": transfer.direction,
+                "amount": float(transfer.amount),
+                "note": transfer.note,
+                "created_at": str(transfer.created_at),
+            }
+
+    async def delete_fund_transfer(self, transfer_id: int) -> bool:
+        """删除银证转账记录。"""
+        from backend.models.fund_transfer import FundTransfer
+        async with self._db_session_factory() as session:
+            stmt = select(FundTransfer).where(FundTransfer.id == transfer_id)
+            result = await session.execute(stmt)
+            row = result.scalar_one_or_none()
+            if row is None:
+                return False
+            await session.delete(row)
+            await session.commit()
+            return True
+
+    async def list_asset_snapshots(self, start_date: date | None = None, end_date: date | None = None) -> list[dict]:
+        """查询资产快照历史。"""
+        from backend.models.daily_asset_snapshot import DailyAssetSnapshot
+        async with self._db_session_factory() as session:
+            stmt = select(DailyAssetSnapshot).order_by(DailyAssetSnapshot.trade_date.desc())
+            if start_date:
+                stmt = stmt.where(DailyAssetSnapshot.trade_date >= start_date)
+            if end_date:
+                stmt = stmt.where(DailyAssetSnapshot.trade_date <= end_date)
+            result = await session.execute(stmt)
+            rows = result.scalars().all()
+            return [
+                {
+                    "id": r.id,
+                    "account_id": r.account_id,
+                    "trade_date": str(r.trade_date),
+                    "snapshot_type": r.snapshot_type,
+                    "total_asset": float(r.total_asset),
+                    "cash": float(r.cash),
+                    "frozen_cash": float(r.frozen_cash),
+                    "market_value": float(r.market_value),
+                    "created_at": str(r.created_at),
+                }
+                for r in rows
+            ]
+
+    async def get_daily_pnl_summary(self, start_date: date | None = None, end_date: date | None = None) -> list[dict]:
+        """每日盈亏汇总：JOIN pre/post snapshot + transfers。"""
+        account_id = self._config.QMT_ACCOUNT_ID
+        async with self._db_session_factory() as session:
+            sql = text("""
+                SELECT
+                    pre.trade_date AS trade_date,
+                    pre.total_asset AS pre_asset,
+                    post.total_asset AS post_asset,
+                    COALESCE(t.net_transfer, 0) AS net_transfer
+                FROM (
+                    SELECT trade_date, total_asset
+                    FROM daily_asset_snapshots
+                    WHERE account_id = :account_id AND snapshot_type = 'pre_market'
+                ) pre
+                LEFT JOIN (
+                    SELECT trade_date, total_asset
+                    FROM daily_asset_snapshots
+                    WHERE account_id = :account_id AND snapshot_type = 'post_market'
+                ) post ON pre.trade_date = post.trade_date
+                LEFT JOIN (
+                    SELECT trade_date,
+                        SUM(CASE WHEN direction = 'deposit' THEN amount ELSE -amount END) AS net_transfer
+                    FROM fund_transfers
+                    WHERE account_id = :account_id
+                    GROUP BY trade_date
+                ) t ON pre.trade_date = t.trade_date
+                WHERE 1=1
+            """)
+            params = {"account_id": account_id}
+            if start_date:
+                sql = text(sql.text + " AND pre.trade_date >= :start_date")
+                params["start_date"] = start_date
+            if end_date:
+                sql = text(sql.text + " AND pre.trade_date <= :end_date")
+                params["end_date"] = end_date
+            sql = text(sql.text + " ORDER BY pre.trade_date DESC")
+
+            result = await session.execute(sql, params)
+            rows = result.fetchall()
+            summary = []
+            for r in rows:
+                pre_a = float(r.pre_asset) if r.pre_asset else None
+                post_a = float(r.post_asset) if r.post_asset else None
+                net_t = float(r.net_transfer) if r.net_transfer else 0
+                daily_pnl = round(post_a - pre_a, 4) if (pre_a is not None and post_a is not None) else None
+                adjusted_pnl = round(daily_pnl - net_t, 4) if daily_pnl is not None else None
+                summary.append({
+                    "trade_date": str(r.trade_date),
+                    "pre_asset": pre_a,
+                    "post_asset": post_a,
+                    "daily_pnl": daily_pnl,
+                    "net_transfer": net_t,
+                    "adjusted_pnl": adjusted_pnl,
+                })
+            return summary
+
+    async def save_asset_snapshot(self, snapshot_type: str) -> bool:
+        """保存资产快照到 MySQL，用于 Worker 调用。"""
+        from backend.models.daily_asset_snapshot import DailyAssetSnapshot
+        asset = await self.get_asset()
+        if asset is None:
+            return False
+        today = date.today()
+        async with self._db_session_factory() as session:
+            try:
+                snapshot = DailyAssetSnapshot(
+                    account_id=self._config.QMT_ACCOUNT_ID,
+                    trade_date=today,
+                    snapshot_type=snapshot_type,
+                    total_asset=asset.get("total_asset", 0),
+                    cash=asset.get("cash", 0),
+                    frozen_cash=asset.get("frozen_cash", 0),
+                    market_value=asset.get("market_value", 0),
+                )
+                session.add(snapshot)
+                await session.commit()
+                logger.info("Asset snapshot saved: type={} date={} total_asset={}", snapshot_type, today, asset.get("total_asset"))
+                return True
+            except Exception as e:
+                await session.rollback()
+                if "Duplicate entry" in str(e):
+                    logger.debug("Asset snapshot already exists: type={} date={}", snapshot_type, today)
+                    return True
+                logger.warning("Failed to save asset snapshot: {}", e)
+                return False
+
+    # ------------------------------------------------------------------
     # 关闭
     # ------------------------------------------------------------------
 

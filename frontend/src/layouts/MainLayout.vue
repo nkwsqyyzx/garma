@@ -26,6 +26,9 @@
         <el-menu-item index="/strategies">
           <span>策略持仓</span>
         </el-menu-item>
+        <el-menu-item index="/fund-history">
+          <span>资金统计</span>
+        </el-menu-item>
       </el-menu>
     </el-aside>
 
