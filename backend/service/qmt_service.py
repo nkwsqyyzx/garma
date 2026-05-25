@@ -764,6 +764,20 @@ class QmtService:
         direction = "buy" if order.order_type == "buy" else "sell"
 
         async with self._db_session_factory() as session:
+            # 已有记录则更新（traded_volume 是累计值，取最新即可）
+            existing = await session.execute(
+                select(StrategyTrade).where(StrategyTrade.order_req_id == req_id)
+            )
+            existing_trade = existing.scalar_one_or_none()
+            if existing_trade:
+                existing_trade.volume = volume
+                existing_trade.price = price
+                existing_trade.amount = round(volume * price, 4)
+                await session.commit()
+                logger.info("Strategy trade updated: req_id={} {} {} vol={}",
+                             req_id, direction, order.stock_code, volume)
+                return
+
             trade = StrategyTrade(
                 account_id=order.account_id,
                 stock_code=order.stock_code,
@@ -877,8 +891,10 @@ class QmtService:
                             matched_trade = (t, trade_key)
                             break
 
-            # 回退：stock_code + order_type + volume + price 近似匹配
-            if not matched_trade:
+            # alpha 前缀的订单只接受精确匹配，不回退到模糊匹配
+            # 防止未成交的 alpha 订单错误消费其他订单的成交记录
+            is_alpha_order = order.req_id.startswith("alpha_") if order.req_id else False
+            if not matched_trade and not is_alpha_order:
                 for t in trades_raw:
                     if t.get("stock_code") != order.stock_code:
                         continue
@@ -1039,9 +1055,9 @@ class QmtService:
                     StrategyTrade.stock_code,
                     StrategyTrade.strategy,
                     StrategyTrade.factor,
-                    StrategyTrade.remark,
-                    StrategyTrade.trade_date,
-                    StrategyTrade.order_req_id,
+                    func.min(StrategyTrade.remark).label("remark"),
+                    func.min(StrategyTrade.trade_date).label("trade_date"),
+                    func.min(StrategyTrade.order_req_id).label("order_req_id"),
                     func.sum(
                         case(
                             (StrategyTrade.direction == "buy", StrategyTrade.volume),
@@ -1060,9 +1076,6 @@ class QmtService:
                     StrategyTrade.stock_code,
                     StrategyTrade.strategy,
                     StrategyTrade.factor,
-                    StrategyTrade.remark,
-                    StrategyTrade.trade_date,
-                    StrategyTrade.order_req_id,
                 )
                 .having(text("holding_volume > 0"))
             )

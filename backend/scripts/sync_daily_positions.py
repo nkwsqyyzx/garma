@@ -73,14 +73,15 @@ def main():
             await conn.run_sync(db_mod.Base.metadata.create_all)
 
         # 1. 聚合 strategy_trades → 当前持仓
-        #    只用 stock_code + position_req_id 分组抵消买卖，
-        #    买入的元数据（remark/strategy/factor/trade_date）从买入记录取
+        #    按 (stock_code, strategy, factor) 分组抵消买卖，
+        #    避免按 position_req_id 分组导致超额卖出被丢弃
         async with db_mod.async_session_factory() as session:
-            # 1a. 按 stock_code + position_req_id 聚合净持仓
+            # 1a. 按 stock_code + strategy + factor 聚合净持仓
             holding_stmt = (
                 select(
                     StrategyTrade.stock_code,
-                    func.coalesce(StrategyTrade.linked_req_id, StrategyTrade.order_req_id).label("position_req_id"),
+                    StrategyTrade.strategy,
+                    StrategyTrade.factor,
                     func.sum(
                         case(
                             (StrategyTrade.direction == "buy", StrategyTrade.volume),
@@ -103,7 +104,8 @@ def main():
                 .where(StrategyTrade.account_id == account_id)
                 .group_by(
                     StrategyTrade.stock_code,
-                    text("position_req_id"),
+                    StrategyTrade.strategy,
+                    StrategyTrade.factor,
                 )
                 .having(text("holding_volume > 0"))
             )
@@ -114,26 +116,27 @@ def main():
             print(f"No open positions found for account {account_id}")
             return
 
-        # 1b. 取每条持仓对应买入记录的元数据
-        req_ids = [h.position_req_id for h in holdings]
-        buy_meta: dict[str, tuple] = {}  # req_id -> (strategy, factor, remark, trade_date)
+        # 1b. 取每条持仓对应买入记录的元数据（取最早的买入记录）
+        buy_meta: dict[tuple, tuple] = {}  # (stock_code, strategy, factor) -> (remark, trade_date)
         async with db_mod.async_session_factory() as session:
             meta_result = await session.execute(
                 select(
-                    StrategyTrade.order_req_id,
+                    StrategyTrade.stock_code,
                     StrategyTrade.strategy,
                     StrategyTrade.factor,
                     StrategyTrade.remark,
                     StrategyTrade.trade_date,
                 )
                 .where(
-                    StrategyTrade.order_req_id.in_(req_ids),
                     StrategyTrade.direction == "buy",
                     StrategyTrade.account_id == account_id,
                 )
+                .order_by(StrategyTrade.trade_date)
             )
             for row in meta_result.all():
-                buy_meta[row[0]] = (row[1], row[2], row[3], row[4])
+                key = (row[0], row[1], row[2])
+                if key not in buy_meta:
+                    buy_meta[key] = (row[3], row[4])
 
         # 2. 获取最新股票名称（Redis 优先，remark 兜底）
         codes = list({h.stock_code for h in holdings})
@@ -141,8 +144,8 @@ def main():
         name_map: dict[str, str] = {}
         for h in holdings:
             if h.stock_code not in name_map:
-                meta = buy_meta.get(h.position_req_id)
-                remark = meta[2] if meta else None
+                meta = buy_meta.get((h.stock_code, h.strategy, h.factor))
+                remark = meta[0] if meta else None
                 name_map[h.stock_code] = redis_names.get(h.stock_code) or _name_from_remark(remark) or h.stock_code
 
         # 3. 删除该日期的旧快照
@@ -166,21 +169,19 @@ def main():
                 avg_price = round(buy_cost / buy_volume, 4) if buy_volume > 0 else 0
                 cost = round(avg_price * volume, 4)
 
-                meta = buy_meta.get(h.position_req_id)
-                strategy = meta[0] if meta else None
-                factor = meta[1] if meta else None
-                remark = meta[2] if meta else None
-                trade_date = meta[3] if meta else date.today()
+                meta = buy_meta.get((h.stock_code, h.strategy, h.factor))
+                remark = meta[0] if meta else None
+                trade_date = meta[1] if meta else date.today()
 
                 pos = DailyPosition(
                     account_id=account_id,
                     snapshot_date=snapshot_date,
                     stock_code=h.stock_code,
                     stock_name=name_map.get(h.stock_code),
-                    strategy=strategy,
-                    factor=factor,
+                    strategy=h.strategy,
+                    factor=h.factor,
                     remark=remark,
-                    order_req_id=h.position_req_id,
+                    order_req_id=f"{h.strategy or ''}|{h.factor or ''}",
                     buy_date=trade_date,
                     volume=volume,
                     avg_price=avg_price,
@@ -212,8 +213,8 @@ def main():
 
         total_pnl = 0.0
         for h in holdings:
-            meta = buy_meta.get(h.position_req_id)
-            trade_date = meta[3] if meta else date.today()
+            meta = buy_meta.get((h.stock_code, h.strategy, h.factor))
+            trade_date = meta[1] if meta else date.today()
             buy_volume = int(h.buy_volume)
             buy_cost = float(h.buy_cost)
             avg_price = buy_cost / buy_volume if buy_volume > 0 else 0
