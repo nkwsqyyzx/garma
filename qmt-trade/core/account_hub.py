@@ -63,29 +63,6 @@ def _normalize_position(raw) -> dict:
 def _normalize_order(raw) -> dict:
     """标准化 xtquant 委托数据（XtOrder 无 stock_name）"""
     try:
-        raw_status = getattr(raw, "order_status", -1)
-        status = ORDER_STATUS_MAP.get(raw_status)
-        if not status:
-            # xtquant 返回了未映射的状态码，记录并推断
-            traded = int(getattr(raw, "traded_volume", 0))
-            ordered = int(getattr(raw, "order_volume", 0))
-            if traded >= ordered > 0:
-                status = "FILLED"
-            elif traded > 0:
-                status = "PARTIALLY_FILLED"
-            elif traded == 0:
-                # 0 成交 + 未知状态 → 大概率已撤单或已废单
-                status = "CANCELLED"
-            else:
-                status = "UNKNOWN"
-            logger.warning(
-                "[WARN] 未知 xtquant order_status=%d, 推断为 %s (order_id=%s stock=%s traded=%d/%d)",
-                raw_status, status,
-                getattr(raw, "order_id", ""),
-                getattr(raw, "stock_code", ""),
-                traded, ordered,
-            )
-
         return {
             "order_id": str(getattr(raw, "order_id", "")),
             "order_sysid": getattr(raw, "order_sysid", "") or "",
@@ -97,7 +74,7 @@ def _normalize_order(raw) -> dict:
             "price_type": int(getattr(raw, "price_type", 0)),
             "price": float(getattr(raw, "price", 0)),
             "traded_price": float(getattr(raw, "traded_price", 0)),
-            "status": status,
+            "status": ORDER_STATUS_MAP.get(getattr(raw, "order_status", -1), "UNKNOWN"),
             "status_msg": getattr(raw, "status_msg", "") or "",
             "order_time": getattr(raw, "order_time", "") or "",
             "strategy_name": getattr(raw, "strategy_name", "") or "",
