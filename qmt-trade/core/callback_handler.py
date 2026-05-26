@@ -287,7 +287,11 @@ class CallbackHandler(XtQuantTraderCallback):
     def _parse_req_id(order_remark: Optional[str]) -> Optional[str]:
         """
         从 order_remark 中提取 req_id。
-        约定：下单时 order_remark 格式为 "alpha:{uuid4}"
+        约定：下单时 order_remark 格式为 "alpha:{req_id}"
+        - req_id 可能为 UUID 格式 (36 字符含 4 个连字符)
+        - 也可能为 alpha_xxx_yyy 格式 (非 UUID)
+        - 注意：QMT 券商端会截断 order_remark，导致 req_id 不完整，
+          此时返回截断后的值，由下游通过前缀匹配定位完整 req_id
         """
         if not order_remark:
             return None
@@ -295,11 +299,15 @@ class CallbackHandler(XtQuantTraderCallback):
         if order_remark.startswith("alpha:"):
             candidate = order_remark[6:]
         elif len(order_remark) == 36 and order_remark.count("-") == 4:
-            candidate = order_remark  # 兼容旧格式
+            candidate = order_remark  # 兼容旧格式 (纯 UUID)
         if candidate:
+            # UUID 格式：完整匹配
             try:
                 uuid.UUID(candidate, version=4)
                 return candidate
             except ValueError:
                 pass
+            # alpha_xxx 格式：可能是完整的也可能是被 QMT 截断的
+            if candidate.startswith("alpha_"):
+                return candidate
         return None

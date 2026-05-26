@@ -819,7 +819,12 @@ class QmtService:
     # ------------------------------------------------------------------
 
     async def update_order_from_event(self, event: dict) -> None:
-        """根据订单事件更新 MySQL（纯 UPDATE，行不存在则跳过）。"""
+        """根据订单事件更新 MySQL（纯 UPDATE，行不存在则跳过）。
+
+        支持截断的 req_id 前缀匹配：QMT 券商端会截断 order_remark，
+        导致回调中的 req_id 不完整（如 "alpha_b420e6c1f8d" 而非
+        "alpha_b420e6c1f8dc4886_1779759166"）。此时通过前缀匹配定位完整 req_id。
+        """
         req_id = event.get("req_id")
         if not req_id:
             logger.warning("Order event missing req_id: {}", event)
@@ -843,6 +848,7 @@ class QmtService:
                 update_data["traded_price"] = event["traded_price"]
 
         async with self._db_session_factory() as session:
+            # 1. 精确匹配
             stmt = (
                 update(QmtOrder)
                 .where(QmtOrder.req_id == req_id)
@@ -850,6 +856,18 @@ class QmtService:
             )
             result = await session.execute(stmt)
             await session.commit()
+
+            # 2. 精确匹配失败时，尝试前缀匹配（处理 QMT 截断 remark 的情况）
+            if result.rowcount == 0 and req_id.startswith("alpha_"):
+                stmt = (
+                    update(QmtOrder)
+                    .where(QmtOrder.req_id.startswith(req_id))
+                    .values(**update_data)
+                )
+                result = await session.execute(stmt)
+                await session.commit()
+                if result.rowcount > 0:
+                    logger.info("Order updated via prefix match: short_req_id={} status={}", req_id, status)
 
         if result.rowcount > 0:
             logger.info("Order updated: req_id={} status={}", req_id, status)

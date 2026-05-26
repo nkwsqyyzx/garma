@@ -122,7 +122,7 @@ class QmtOrderWorker:
                 await self._ack(msg_id)
                 return
 
-            # 更新 MySQL
+            # 尝试更新 MySQL（支持截断的 req_id 前缀匹配）
             if self._service:
                 await self._service.update_order_from_event(event)
 
