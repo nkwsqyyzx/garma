@@ -6,7 +6,7 @@
     </div>
 
     <!-- PC: 表格 -->
-    <el-table v-if="!isMobile" :data="orders" stripe style="width: 100%">
+    <el-table v-if="!isMobile" :data="sortedOrders" stripe style="width: 100%">
       <el-table-column label="时间" width="130">
         <template #default="{ row }">{{ formatTime(row.order_time) }}</template>
       </el-table-column>
@@ -26,13 +26,13 @@
       <el-table-column prop="traded_volume" label="已成交" width="90" align="right" />
       <el-table-column label="状态" width="100" align="center">
         <template #default="{ row }">
-          <el-tag :type="statusType(resolveStatus(row))" size="small">{{ statusLabel(resolveStatus(row)) }}</el-tag>
+          <el-tag :type="statusType(row.display_status)" size="small">{{ statusLabel(row.display_status) }}</el-tag>
         </template>
       </el-table-column>
       <el-table-column label="操作" width="80" align="center">
         <template #default="{ row }">
           <el-button
-            v-if="isCancelable(resolveStatus(row))"
+            v-if="isCancelable(row.display_status)"
             type="warning"
             size="small"
             text
@@ -44,7 +44,7 @@
 
     <!-- 手机: 卡片 -->
     <div v-else>
-      <el-card v-for="order in orders" :key="order.order_id" shadow="hover" class="order-card">
+      <el-card v-for="order in sortedOrders" :key="order.order_id" shadow="hover" class="order-card">
         <div class="card-row">
           <div class="card-left">
             <el-tag :type="order.order_type === 'buy' ? 'danger' : 'success'" size="small">
@@ -53,19 +53,19 @@
             <span class="card-name">{{ order.stock_name || order.stock_code }}</span>
           </div>
           <div class="card-right">
-            <el-tag :type="statusType(resolveStatus(order))" size="small">{{ statusLabel(resolveStatus(order)) }}</el-tag>
+            <el-tag :type="statusType(order.display_status)" size="small">{{ statusLabel(order.display_status) }}</el-tag>
           </div>
         </div>
         <div class="card-info">
           <span>{{ formatTime(order.order_time) }}</span>
           <span>{{ formatPrice(order.stock_code, order.price) }} x {{ order.order_volume }}</span>
           <span>成交 {{ order.traded_volume }}</span>
-          <el-button v-if="isCancelable(resolveStatus(order))" type="warning" size="small" text @click="onCancel(order)">撤单</el-button>
+          <el-button v-if="isCancelable(order.display_status)" type="warning" size="small" text @click="onCancel(order)">撤单</el-button>
         </div>
       </el-card>
     </div>
 
-    <div v-if="!orders.length" class="empty-text">暂无委托</div>
+    <div v-if="!sortedOrders.length" class="empty-text">暂无委托</div>
   </div>
 </template>
 
@@ -82,35 +82,15 @@ const account = useAccountStore()
 const { orders } = storeToRefs(account)
 const { isMobile } = useBreakpoint()
 
-const CANCELABLE = new Set(['submitted', 'reported', 'partial', 'PENDING', 'SUBMITTED', 'PARTIALLY_FILLED'])
+const CANCELABLE = new Set(['submitted', 'partial'])
 
-const hasCancelable = computed(() => orders.value.some(o => isCancelable(resolveStatus(o))))
+const sortedOrders = computed(() =>
+  [...orders.value].sort((a, b) => (b.order_time || 0) - (a.order_time || 0)),
+)
 
-function resolveStatus(order: any): string {
-  const s = order.status || ''
-  const vol = order.order_volume || 0
-  const traded = order.traded_volume || 0
-  // 完全成交 → filled（不管原始状态是什么）
-  if (vol > 0 && traded >= vol) return 'filled'
-  // 部分成交
-  if (traded > 0 && traded < vol) return 'partial'
-  // QMT 原始状态映射
-  const map: Record<string, string> = {
-    CANCELING: 'cancelled',
-    CANCELLED: 'cancelled',
-    // UNKNOWN + 0成交：券商侧已处理完毕但 xtquant 未回调终态（如手工撤单），视为已撤
-    // UNKNOWN + 有成交：走上方的 partial/filled 分支
-    UNKNOWN: 'cancelled',
-    PENDING: 'submitted',
-    SUBMITTED: 'submitted',
-    PARTIALLY_FILLED: 'partial',
-    FILLED: 'filled',
-    REJECTED: 'rejected',
-    CANCEL_FAILED: 'submitted',
-    PARTIALLY_CANCELLED: 'cancelled',
-  }
-  return map[s] || s
-}
+const hasCancelable = computed(() =>
+  orders.value.some(o => isCancelable(o.display_status)),
+)
 
 function isCancelable(status: string): boolean {
   return CANCELABLE.has(status)
@@ -118,22 +98,24 @@ function isCancelable(status: string): boolean {
 
 function statusType(status: string): string {
   const map: Record<string, string> = {
-    filled: 'success', FILLED: 'success',
-    cancelled: 'info', CANCELLED: 'info',
-    rejected: 'danger', REJECTED: 'danger',
-    submitted: 'warning', SUBMITTED: 'warning',
-    partial: '', PARTIALLY_FILLED: '',
+    filled: 'success',
+    cancelled: 'info',
+    partially_cancelled: 'info',
+    rejected: 'danger',
+    submitted: 'warning',
+    partial: '',
   }
   return map[status] || 'info'
 }
 
 function statusLabel(status: string): string {
   const map: Record<string, string> = {
-    PENDING: '待报', submitted: '已报', SUBMITTED: '已报',
-    partial: '部成', PARTIALLY_FILLED: '部成',
-    filled: '已成', FILLED: '已成',
-    cancelled: '已撤', CANCELLED: '已撤',
-    REJECTED: '废单', rejected: '废单',
+    submitted: '已报',
+    partial: '部成',
+    filled: '已成',
+    cancelled: '已撤',
+    partially_cancelled: '部撤',
+    rejected: '废单',
   }
   return map[status] || status
 }

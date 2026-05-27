@@ -124,14 +124,20 @@ export interface StrategyTrade {
   amount: number
   strategy: string
   factor: string
+  remark: string
   trade_date: string
+  order_req_id: string
+  source: string
   pct_change: number
   pnl: number
 }
 
-export async function getStrategyTrades(tradeDate?: string) {
-  const params = tradeDate ? `?trade_date=${tradeDate}` : ''
-  return request<StrategyTrade[]>(`/strategy/trades${params}`)
+export async function getStrategyTrades(tradeDate?: string, source?: string) {
+  const params = new URLSearchParams()
+  if (tradeDate) params.set('trade_date', tradeDate)
+  if (source) params.set('source', source)
+  const qs = params.toString()
+  return request<StrategyTrade[]>(`/strategy/trades${qs ? '?' + qs : ''}`)
 }
 
 // ── 银证转账 ─────────────────────────────────────────

@@ -13,6 +13,7 @@ const router = createRouter({
         { path: 'trades', name: 'trades', component: () => import('@/views/Trades.vue') },
         { path: 'trade', name: 'trade', component: () => import('@/views/Trade.vue') },
         { path: 'strategies', name: 'strategies', component: () => import('@/views/StrategyPositions.vue') },
+        { path: 'manual-trades', name: 'manual-trades', component: () => import('@/views/ManualTrades.vue') },
         { path: 'fund-history', name: 'fund-history', component: () => import('@/views/FundHistory.vue') },
       ],
     },

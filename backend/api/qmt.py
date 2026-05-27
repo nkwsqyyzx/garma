@@ -200,10 +200,11 @@ async def strategy_positions(
 @router.get("/strategy/trades")
 async def strategy_trades(
     trade_date: date | None = Query(None, description="交易日期，如 2026-05-22"),
+    source: str | None = Query(None, description="来源过滤，如 manual/order/import"),
     svc: QmtService = Depends(get_qmt_service),
 ):
     """策略成交：从 strategy_trades 表查询成交流水。"""
-    data = await svc.get_strategy_trades(trade_date=trade_date)
+    data = await svc.get_strategy_trades(trade_date=trade_date, source=source)
     return _api_ok(data)
 
 

@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 import redis
 from loguru import logger
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 from backend.config import (
     Settings,
     KEY_ACCOUNT_ASSET,
@@ -59,6 +59,56 @@ _PROXY_BLOCKED_PREFIXES = (
     "/api/v1/trade/cancel",
     "/api/v1/control/",
 )
+
+_CANCEL_STATUSES = frozenset({"CANCELING", "CANCELLED", "PARTIALLY_CANCELLED"})
+
+
+def _resolve_display_status(order: dict) -> str:
+    """根据原始状态 + 成交量计算规范化的 display_status。
+
+    规则:
+      - 完全成交 → filled
+      - 撤单中/已撤 + 有部分成交 → partially_cancelled
+      - 撤单中/已撤 + 无成交 → cancelled
+      - UNKNOWN + 有部分成交 → partially_cancelled (手工撤单)
+      - UNKNOWN + 无成交 → cancelled
+      - 部分成交（未撤）→ partial
+      - REJECTED → rejected
+      - PENDING / SUBMITTED / CANCEL_FAILED → submitted
+      - FILLED → filled
+    """
+    s = order.get("status", "")
+    vol = order.get("order_volume", 0) or 0
+    traded = order.get("traded_volume", 0) or 0
+
+    # 完全成交优先
+    if vol > 0 and traded >= vol:
+        return "filled"
+
+    # 撤单状态 + 有部分成交 → 部撤
+    if s in _CANCEL_STATUSES and traded > 0:
+        return "partially_cancelled"
+    if s in _CANCEL_STATUSES:
+        return "cancelled"
+
+    # UNKNOWN: 券商侧已完结但 xtquant 未回调终态（如手工撤单）
+    if s == "UNKNOWN":
+        return "partially_cancelled" if traded > 0 else "cancelled"
+
+    # 部分成交（未撤）
+    if traded > 0 < vol and traded < vol:
+        return "partial"
+
+    # 其他原始状态映射
+    _map = {
+        "PENDING": "submitted",
+        "SUBMITTED": "submitted",
+        "FILLED": "filled",
+        "REJECTED": "rejected",
+        "CANCEL_FAILED": "submitted",
+        "PARTIALLY_FILLED": "partial",
+    }
+    return _map.get(s, s.lower() if s else "submitted")
 
 
 class QmtService:
@@ -369,13 +419,15 @@ class QmtService:
         return await self._get_positions_from_db()
 
     async def get_orders(self, cancelable_only: bool = False) -> list[dict]:
-        """读取当日委托列表。"""
+        """读取当日委托列表，附带 display_status。"""
         data = await self._redis_get_json(KEY_ACCOUNT_ORDERS)
         if not isinstance(data, list):
             return []
+        for o in data:
+            o['display_status'] = _resolve_display_status(o)
         if cancelable_only:
-            cancelable = {"submitted", "reported", "partial"}
-            return [o for o in data if o.get("status", "") in cancelable]
+            cancelable = {"submitted", "partial"}
+            return [o for o in data if o.get("display_status", "") in cancelable]
         return data
 
     async def get_trades(self) -> list[dict]:
@@ -847,6 +899,10 @@ class QmtService:
             if event.get("traded_price") is not None:
                 update_data["traded_price"] = event["traded_price"]
 
+        # traded_volume 只增不减：防止乱序/延迟的分笔事件覆盖全量值
+        tv_event = update_data.pop("traded_volume", None)
+        tp_event = update_data.pop("traded_price", None)
+
         async with self._db_session_factory() as session:
             # 1. 精确匹配
             stmt = (
@@ -854,6 +910,12 @@ class QmtService:
                 .where(QmtOrder.req_id == req_id)
                 .values(**update_data)
             )
+            if tv_event is not None:
+                stmt = stmt.values(
+                    traded_volume=func.greatest(QmtOrder.traded_volume, tv_event),
+                )
+                if tp_event is not None and tv_event > 0:
+                    stmt = stmt.values(traded_price=tp_event)
             result = await session.execute(stmt)
             await session.commit()
 
@@ -864,6 +926,12 @@ class QmtService:
                     .where(QmtOrder.req_id.startswith(req_id))
                     .values(**update_data)
                 )
+                if tv_event is not None:
+                    stmt = stmt.values(
+                        traded_volume=func.greatest(QmtOrder.traded_volume, tv_event),
+                    )
+                    if tp_event is not None and tv_event > 0:
+                        stmt = stmt.values(traded_price=tp_event)
                 result = await session.execute(stmt)
                 await session.commit()
                 if result.rowcount > 0:
@@ -925,18 +993,33 @@ class QmtService:
         direction = "buy" if order.order_type == "buy" else "sell"
 
         async with self._db_session_factory() as session:
-            # 已有记录则更新（traded_volume 是累计值，取最新即可）
+            # 重新查询 order 获取最新的 traded_volume/traded_price 作为真值
+            # (event 的 traded_volume 可能是分笔值，直接使用会导致数据不准)
+            fresh_result = await session.execute(
+                select(QmtOrder).where(QmtOrder.req_id == req_id)
+            )
+            fresh_order = fresh_result.scalar_one_or_none()
+            if fresh_order and int(fresh_order.traded_volume or 0) > 0:
+                actual_vol = int(fresh_order.traded_volume)
+                actual_price = float(fresh_order.traded_price or price)
+            else:
+                # DB 尚未更新，fallback 到 event 值
+                actual_vol = volume
+                actual_price = price
+
             existing = await session.execute(
                 select(StrategyTrade).where(StrategyTrade.order_req_id == req_id)
             )
             existing_trade = existing.scalar_one_or_none()
             if existing_trade:
-                existing_trade.volume = volume
-                existing_trade.price = price
-                existing_trade.amount = round(volume * price, 4)
-                await session.commit()
-                logger.info("Strategy trade updated: req_id={} {} {} vol={}",
-                             req_id, direction, order.stock_code, volume)
+                # 更新已有记录 — 用 DB 的最新 traded_volume
+                if actual_vol > 0 and actual_vol != existing_trade.volume:
+                    existing_trade.volume = actual_vol
+                    existing_trade.price = actual_price
+                    existing_trade.amount = round(actual_vol * actual_price, 4)
+                    await session.commit()
+                    logger.info("Strategy trade updated: req_id={} {} {} vol={}",
+                                 req_id, direction, order.stock_code, actual_vol)
                 return
 
             trade = StrategyTrade(
@@ -944,9 +1027,9 @@ class QmtService:
                 stock_code=order.stock_code,
                 stock_name=order.stock_name,
                 direction=direction,
-                volume=volume,
-                price=price,
-                amount=round(volume * price, 4),
+                volume=actual_vol,
+                price=actual_price,
+                amount=round(actual_vol * actual_price, 4),
                 strategy=strategy,
                 factor=factor,
                 remark=remark,
@@ -960,7 +1043,7 @@ class QmtService:
             await session.commit()
 
         logger.info("Strategy trade recorded: req_id={} {} {} vol={} price={}",
-                     req_id, direction, order.stock_code, volume, price)
+                     req_id, direction, order.stock_code, actual_vol, actual_price)
 
     async def reconcile_strategy_trades(self) -> int:
         """从 Redis qmt:account:trades 对账，补录缺失的 strategy_trades。
@@ -1036,6 +1119,56 @@ class QmtService:
         trades_to_insert: list[StrategyTrade] = []
         orders_to_update: dict[str, dict] = {}  # req_id -> {traded_price, traded_volume, order_id}
         used_trade_keys: set[str] = set()  # 避免同一条 trade 匹配多个 order
+
+        # 4a. 修正已有 strategy_trades 的 volume 差异
+        #     用 Redis qmt:account:orders 的 traded_volume 作为真值
+        #     （MySQL qmt_orders 可能是过时的分笔值）
+        redis_orders_raw = await self._redis_get_json(KEY_ACCOUNT_ORDERS)
+        redis_orders_by_id: dict[str, dict] = {}
+        if isinstance(redis_orders_raw, list):
+            for ro in redis_orders_raw:
+                oid = str(ro.get("order_id", ""))
+                if oid and oid != "0":
+                    redis_orders_by_id[oid] = ro
+
+        if recorded_req_ids:
+            async with self._db_session_factory() as session:
+                result = await session.execute(
+                    select(StrategyTrade).where(
+                        StrategyTrade.source == "order",
+                        StrategyTrade.order_req_id.in_(list(recorded_req_ids)),
+                    )
+                )
+                existing_trades = {t.order_req_id: t for t in result.scalars().all()}
+
+            orders_by_req = {o.req_id: o for o in orders}
+            fixed = 0
+            for req_id, st in existing_trades.items():
+                o = orders_by_req.get(req_id)
+                if not o:
+                    continue
+                # 优先使用 Redis order 级别数据（最准确）
+                redis_order = redis_orders_by_id.get(str(o.order_id or ""))
+                if redis_order:
+                    order_vol = int(redis_order.get("traded_volume", 0))
+                    order_price = float(redis_order.get("traded_price", 0))
+                else:
+                    # Redis 没有则用 MySQL 的值
+                    order_vol = int(o.traded_volume or 0)
+                    order_price = float(o.traded_price or st.price)
+                if order_vol > 0 and st.volume != order_vol:
+                    old_vol = st.volume
+                    st.volume = order_vol
+                    st.price = order_price or float(st.price)
+                    st.amount = round(order_vol * st.price, 4)
+                    async with self._db_session_factory() as session:
+                        session.add(st)
+                        await session.commit()
+                    fixed += 1
+                    logger.info("Reconcile fixed volume: req_id={} {} {} {}->{}",
+                                req_id, st.direction, st.stock_code, old_vol, order_vol)
+            if fixed:
+                logger.info("Reconcile fixed {} strategy_trades volume mismatches", fixed)
 
         for order in orders:
             if order.req_id in recorded_req_ids:
@@ -1309,7 +1442,7 @@ class QmtService:
     # 策略成交
     # ------------------------------------------------------------------
 
-    async def get_strategy_trades(self, trade_date: date | None = None) -> list[dict]:
+    async def get_strategy_trades(self, trade_date: date | None = None, source: str | None = None) -> list[dict]:
         """从 strategy_trades 查询成交流水，补充实时行情（仅买入）。"""
         from sqlalchemy import func
         from backend.utils.adjustment import get_adjustment_factors, calc_adjusted_return
@@ -1325,11 +1458,13 @@ class QmtService:
                 .where(StrategyTrade.trade_date == trade_date)
                 .order_by(StrategyTrade.id)
             )
+            if source:
+                stmt = stmt.where(StrategyTrade.source == source)
             result = await session.execute(stmt)
             rows = result.scalars().all()
 
-            # 无结果时回退到最近交易日
-            if not rows:
+            # 无结果时回退到最近交易日（仅 source 不指定时回退）
+            if not rows and not source:
                 max_date_stmt = (
                     select(func.max(StrategyTrade.trade_date))
                     .where(StrategyTrade.account_id == self._config.QMT_ACCOUNT_ID)
@@ -1396,8 +1531,10 @@ class QmtService:
                 "amount": float(r.amount),
                 "strategy": r.strategy or "",
                 "factor": r.factor or "",
+                "remark": r.remark or "",
                 "trade_date": str(r.trade_date),
                 "order_req_id": r.order_req_id or "",
+                "source": r.source or "",
                 "pct_change": 0,
                 "pnl": 0,
             }
