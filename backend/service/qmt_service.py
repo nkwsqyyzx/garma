@@ -497,6 +497,9 @@ class QmtService:
 
         卖出时使用 SELECT FOR UPDATE 行级锁 + 事务内校验，
         防止并发卖出超出可用持仓。
+
+        FIFO 分配：卖出时若未指定 linked_req_id/linked_batch_id，
+        自动按买入时间最早优先分配 linked_req_id。
         """
         req_id = f"alpha_{uuid.uuid4().hex[:16]}_{int(time.time())}"
 
@@ -510,6 +513,11 @@ class QmtService:
         effective_batch_id = request.batch_id
         if not effective_batch_id and request.order_type == "sell":
             effective_batch_id = request.linked_batch_id
+
+        # FIFO 解析：卖出时自动分配 linked_req_id
+        resolved_linked_req_id = request.linked_req_id
+        if request.order_type == "sell" and not resolved_linked_req_id and not request.linked_batch_id:
+            resolved_linked_req_id = await self._fifo_resolve_linked_req_id(request.stock_code, request.order_volume)
 
         if request.order_type == "sell":
             # ── 卖出路径：单一事务内完成 策略继承 + 持仓校验 + 下单 ──
@@ -526,7 +534,7 @@ class QmtService:
                 )
 
                 # 2) 继承策略元数据
-                if (not strategy_name or not order_remark) and (request.linked_batch_id or request.linked_req_id):
+                if (not strategy_name or not order_remark) and (request.linked_batch_id or resolved_linked_req_id):
                     if request.linked_batch_id:
                         meta_result = await session.execute(
                             select(
@@ -546,7 +554,7 @@ class QmtService:
                                 StrategyTrade.remark,
                                 StrategyTrade.stock_name,
                             )
-                            .where(StrategyTrade.order_req_id == request.linked_req_id)
+                            .where(StrategyTrade.order_req_id == resolved_linked_req_id)
                             .limit(1)
                         )
                     row = meta_result.first()
@@ -625,7 +633,7 @@ class QmtService:
                     price=request.price,
                     strategy_name=strategy_name,
                     order_remark=order_remark,
-                    linked_req_id=request.linked_req_id,
+                    linked_req_id=resolved_linked_req_id,
                     batch_id=effective_batch_id,
                     status="DRAFT",
                 )
@@ -708,7 +716,7 @@ class QmtService:
             "price": request.price,
             "strategy_name": request.strategy_name or "",
             "order_remark": request.order_remark or "",
-            "linked_req_id": request.linked_req_id or "",
+            "linked_req_id": resolved_linked_req_id or "",
             "batch_id": request.batch_id or "",
             "retry_count": 0,
             "created_at": time.time(),
@@ -1348,6 +1356,75 @@ class QmtService:
             logger.info("Updated {} qmt_orders with fill data", len(orders_to_update))
 
         return inserted
+
+    # ------------------------------------------------------------------
+    # FIFO linked_req_id 分配
+    # ------------------------------------------------------------------
+
+    async def _fifo_resolve_linked_req_id(self, stock_code: str, sell_volume: int) -> str | None:
+        """按 FIFO（买入日期最早优先）分配卖出订单的 linked_req_id。
+
+        从 strategy_trades 中查找该股票所有有净持仓的买入组，
+        按买入日期升序排列，将卖出量分配到最早买入的组。
+        返回分配到的第一个买入组的 order_req_id。
+
+        如果找不到持仓则返回 None（由后续校验拦截）。
+        """
+        from sqlalchemy import func, case
+
+        position_key_expr = func.coalesce(
+            StrategyTrade.batch_id,
+            case(
+                (StrategyTrade.direction == "sell", StrategyTrade.linked_req_id),
+                else_=StrategyTrade.order_req_id,
+            ),
+        )
+
+        async with self._db_session_factory() as session:
+            # 按 position_key 聚合净持仓，取最早买入日期
+            stmt = (
+                select(
+                    position_key_expr.label("position_key"),
+                    func.min(StrategyTrade.trade_date).label("earliest_date"),
+                    func.min(
+                        case(
+                            (StrategyTrade.direction == "buy", StrategyTrade.order_req_id),
+                            else_=None,
+                        )
+                    ).label("buy_req_id"),
+                    func.sum(
+                        case(
+                            (StrategyTrade.direction == "buy", StrategyTrade.volume),
+                            else_=-StrategyTrade.volume,
+                        )
+                    ).label("net_volume"),
+                )
+                .where(
+                    StrategyTrade.stock_code == stock_code,
+                    StrategyTrade.account_id == self._config.QMT_ACCOUNT_ID,
+                )
+                .group_by(text("position_key"))
+                .having(text("net_volume > 0"))
+                .order_by(text("earliest_date"))
+            )
+            result = await session.execute(stmt)
+            rows = result.all()
+
+        if not rows:
+            return None
+
+        # FIFO: 按 earliest_date 升序，分配卖出量
+        remaining = sell_volume
+        for row in rows:
+            net_vol = int(row[3])
+            if net_vol <= 0:
+                continue
+            remaining -= net_vol
+            # 返回第一个被分配到的买入组的 order_req_id
+            return row[2]
+
+        # 如果所有组都不够（理论上不会到这里，因为后面有可用持仓校验）
+        return rows[0][2] if rows else None
 
     # ------------------------------------------------------------------
     # Redis 异步包装（asyncio.to_thread 包装同步 redis 调用）
