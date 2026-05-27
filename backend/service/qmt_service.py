@@ -883,7 +883,9 @@ class QmtService:
             return
 
         status = event.get("status", "")
-        update_data: dict[str, Any] = {"status": status}
+        update_data: dict[str, Any] = {}
+        if status:
+            update_data["status"] = status
 
         if event.get("order_id"):
             update_data["order_id"] = event["order_id"]
@@ -903,6 +905,10 @@ class QmtService:
         tv_event = update_data.pop("traded_volume", None)
         tp_event = update_data.pop("traded_price", None)
 
+        # 没有有效字段时跳过数据库操作
+        if not update_data and tv_event is None:
+            return
+
         async with self._db_session_factory() as session:
             # 1. 精确匹配
             stmt = (
@@ -919,23 +925,31 @@ class QmtService:
             result = await session.execute(stmt)
             await session.commit()
 
-            # 2. 精确匹配失败时，尝试前缀匹配（处理 QMT 截断 remark 的情况）
+            # 2. 精确匹配失败时，先 SELECT 找到完整 req_id，再 UPDATE（避免误匹配多行）
             if result.rowcount == 0 and req_id.startswith("alpha_"):
-                stmt = (
-                    update(QmtOrder)
+                match_stmt = (
+                    select(QmtOrder.req_id)
                     .where(QmtOrder.req_id.startswith(req_id))
-                    .values(**update_data)
+                    .limit(1)
                 )
-                if tv_event is not None:
-                    stmt = stmt.values(
-                        traded_volume=func.greatest(QmtOrder.traded_volume, tv_event),
+                match_result = await session.execute(match_stmt)
+                matched_req_id = match_result.scalar_one_or_none()
+                if matched_req_id:
+                    stmt = (
+                        update(QmtOrder)
+                        .where(QmtOrder.req_id == matched_req_id)
+                        .values(**update_data)
                     )
-                    if tp_event is not None and tv_event > 0:
-                        stmt = stmt.values(traded_price=tp_event)
-                result = await session.execute(stmt)
-                await session.commit()
-                if result.rowcount > 0:
-                    logger.info("Order updated via prefix match: short_req_id={} status={}", req_id, status)
+                    if tv_event is not None:
+                        stmt = stmt.values(
+                            traded_volume=func.greatest(QmtOrder.traded_volume, tv_event),
+                        )
+                        if tp_event is not None and tv_event > 0:
+                            stmt = stmt.values(traded_price=tp_event)
+                    result = await session.execute(stmt)
+                    await session.commit()
+                    if result.rowcount > 0:
+                        logger.info("Order updated via prefix match: short_req_id={} matched={} status={}", req_id, matched_req_id, status)
 
         if result.rowcount > 0:
             logger.info("Order updated: req_id={} status={}", req_id, status)
@@ -1022,6 +1036,19 @@ class QmtService:
                                  req_id, direction, order.stock_code, actual_vol)
                 return
 
+            # 卖出订单缺少 batch_id 时，从关联买入的 strategy_trades 继承
+            resolved_batch_id = getattr(order, "batch_id", None)
+            if not resolved_batch_id and direction == "sell" and getattr(order, "linked_req_id", None):
+                batch_result = await session.execute(
+                    select(StrategyTrade.batch_id)
+                    .where(StrategyTrade.order_req_id == order.linked_req_id)
+                    .where(StrategyTrade.batch_id.isnot(None))
+                    .limit(1)
+                )
+                batch_row = batch_result.first()
+                if batch_row:
+                    resolved_batch_id = batch_row[0]
+
             trade = StrategyTrade(
                 account_id=order.account_id,
                 stock_code=order.stock_code,
@@ -1037,10 +1064,18 @@ class QmtService:
                 source="order",
                 order_req_id=req_id,
                 linked_req_id=getattr(order, "linked_req_id", None),
-                batch_id=getattr(order, "batch_id", None),
+                batch_id=resolved_batch_id,
             )
             session.add(trade)
             await session.commit()
+
+            # 回填 qmt_orders 的 batch_id（卖出订单创建时可能缺失）
+            if resolved_batch_id and not getattr(order, "batch_id", None):
+                await session.execute(
+                    update(QmtOrder).where(QmtOrder.req_id == req_id)
+                    .values(batch_id=resolved_batch_id)
+                )
+                await session.commit()
 
         logger.info("Strategy trade recorded: req_id={} {} {} vol={} price={}",
                      req_id, direction, order.stock_code, actual_vol, actual_price)
@@ -1094,6 +1129,7 @@ class QmtService:
                         StrategyTrade.strategy,
                         StrategyTrade.factor,
                         StrategyTrade.remark,
+                        StrategyTrade.batch_id,
                     ).where(StrategyTrade.order_req_id.in_(linked_req_ids))
                 )
                 for row in result.all():
@@ -1101,6 +1137,7 @@ class QmtService:
                         "strategy": row[1],
                         "factor": row[2],
                         "remark": row[3],
+                        "batch_id": row[4],
                     }
 
         # 3. 查已有的 strategy_trades（source=order）的 order_req_id 集合
@@ -1143,6 +1180,7 @@ class QmtService:
 
             orders_by_req = {o.req_id: o for o in orders}
             fixed = 0
+            dirty_trades: list[StrategyTrade] = []
             for req_id, st in existing_trades.items():
                 o = orders_by_req.get(req_id)
                 if not o:
@@ -1156,17 +1194,19 @@ class QmtService:
                     # Redis 没有则用 MySQL 的值
                     order_vol = int(o.traded_volume or 0)
                     order_price = float(o.traded_price or st.price)
-                if order_vol > 0 and st.volume != order_vol:
+                if order_vol > 0 and order_vol > st.volume:
                     old_vol = st.volume
                     st.volume = order_vol
                     st.price = order_price or float(st.price)
                     st.amount = round(order_vol * st.price, 4)
-                    async with self._db_session_factory() as session:
-                        session.add(st)
-                        await session.commit()
+                    dirty_trades.append(st)
                     fixed += 1
                     logger.info("Reconcile fixed volume: req_id={} {} {} {}->{}",
                                 req_id, st.direction, st.stock_code, old_vol, order_vol)
+            if dirty_trades:
+                async with self._db_session_factory() as session:
+                    session.add_all(dirty_trades)
+                    await session.commit()
             if fixed:
                 logger.info("Reconcile fixed {} strategy_trades volume mismatches", fixed)
 
@@ -1270,6 +1310,10 @@ class QmtService:
                 source="order",
                 order_req_id=order.req_id,
                 linked_req_id=order.linked_req_id,
+                batch_id=order.batch_id or (
+                    linked_buy_st_map.get(order.linked_req_id or "", {}).get("batch_id")
+                    if order.linked_req_id else None
+                ),
             ))
             # 记录需要更新 qmt_orders 的成交信息
             update_vals: dict[str, Any] = {

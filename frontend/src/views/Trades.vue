@@ -9,9 +9,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref } from 'vue'
 import StrategyTradeTable from '@/components/StrategyTradeTable.vue'
 import { getStrategyTrades, type StrategyTrade } from '@/api/qmt'
+import { useTradingPolling } from '@/composables/usePolling'
 
 export interface TradeRow {
   stock_code: string
@@ -113,7 +114,7 @@ async function loadData() {
   }
 }
 
-onMounted(() => loadData())
+useTradingPolling(loadData)
 </script>
 
 <style scoped>

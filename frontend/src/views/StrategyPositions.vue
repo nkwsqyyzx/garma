@@ -11,10 +11,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import StrategyPositionTable from '@/components/StrategyPositionTable.vue'
 import { getStrategyPositions, getAsset, type StrategyPosition } from '@/api/qmt'
+import { useTradingPolling } from '@/composables/usePolling'
 
 const router = useRouter()
 const loading = ref(false)
@@ -157,7 +158,7 @@ function onRowClick(code: string) {
   router.push(`/position/${encodeURIComponent(code)}`)
 }
 
-onMounted(() => loadData())
+useTradingPolling(loadData)
 </script>
 
 <style scoped>
